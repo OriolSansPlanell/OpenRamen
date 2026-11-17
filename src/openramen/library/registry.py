@@ -21,6 +21,30 @@ class Registry:
 
     def __init__(self) -> None:
         self._specs: dict[str, NodeSpec] = {}
+        self._providers: list[Any] = []
+
+    def add_provider(self, provider: Any) -> None:
+        """Attach a lazy source of specs, such as an imported module.
+
+        A provider has a ``prefix``, lists candidate ids with ``ids()`` and
+        builds one spec with ``load(id)`` (``None`` if it cannot).  Specs are
+        built the first time they are asked for.
+        """
+        self._providers = [p for p in self._providers if p.prefix != provider.prefix]
+        self._providers.append(provider)
+        self._providers.sort(key=lambda p: len(p.prefix), reverse=True)
+
+    @property
+    def providers(self) -> list[Any]:
+        return list(self._providers)
+
+    def import_module(self, module: str, **options: Any) -> Any:
+        """Make the functions of a Python module available as nodes.
+
+        See :func:`openramen.library.importer.import_module`.
+        """
+        from .importer import import_module
+        return import_module(self, module, **options)
 
     def register(self, spec: NodeSpec, *, replace: bool = False) -> NodeSpec:
         if not isinstance(spec, NodeSpec):
@@ -47,41 +71,61 @@ class Registry:
         return decorate
 
     def get(self, id: str) -> NodeSpec:
-        try:
-            return self._specs[id]
-        except KeyError:
-            raise UnknownSpecError(id) from None
+        spec = self.find(id)
+        if spec is None:
+            raise UnknownSpecError(id)
+        return spec
 
     def find(self, id: str) -> Optional[NodeSpec]:
-        return self._specs.get(id)
+        spec = self._specs.get(id)
+        if spec is not None or not isinstance(id, str):
+            return spec
+        for provider in self._providers:      # longest prefix first
+            if id.startswith(provider.prefix + "."):
+                spec = provider.load(id)
+                if spec is not None:
+                    self._specs[id] = spec
+                    return spec
+        return None
 
     def __contains__(self, id: object) -> bool:
-        return id in self._specs
+        return isinstance(id, str) and self.find(id) is not None
 
     def __iter__(self) -> Iterator[NodeSpec]:
-        return iter(self._specs.values())
+        """Every spec, building the lazily provided ones on the way."""
+        for id in self.ids():
+            spec = self.find(id)
+            if spec is not None:
+                yield spec
 
     def __len__(self) -> int:
-        return len(self._specs)
+        return len(self.ids())
 
     def ids(self) -> list[str]:
-        return sorted(self._specs)
+        """All known ids.  Lazily provided ones are candidates until built."""
+        ids = set(self._specs)
+        for provider in self._providers:
+            ids.update(provider.ids())
+        return sorted(ids)
 
     def categories(self) -> dict[str, list[NodeSpec]]:
         """Specs grouped by category, both levels sorted."""
         groups: dict[str, list[NodeSpec]] = {}
-        for spec in sorted(self._specs.values(), key=lambda s: s.id):
+        for spec in self:
             groups.setdefault(spec.category, []).append(spec)
         return dict(sorted(groups.items()))
 
     def copy(self) -> "Registry":
         clone = Registry()
         clone._specs = dict(self._specs)
+        clone._providers = list(self._providers)
         return clone
 
     def update(self, other: "Registry", *, replace: bool = False) -> None:
-        for spec in other:
+        for spec in list(other._specs.values()):
             self.register(spec, replace=replace)
+        for provider in other._providers:
+            self.add_provider(provider)
 
 
 _default: Optional[Registry] = None

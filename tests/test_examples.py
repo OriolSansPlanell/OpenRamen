@@ -27,9 +27,10 @@ def test_example_is_valid(path):
     assert set(result.durations) == {n.id for n in graph}
     # every example is stored exactly as OpenRamen itself would write it
     assert graph.dumps() == path.read_text(encoding="utf-8")
-    # and only uses nodes of the base palette
-    registry = ramen.default_registry()
+    # and only uses the base palette plus the modules it declares
+    registry = ramen.registry_for(graph)
     assert all(node.spec in registry for node in graph)
+    assert set(graph.imports) <= {"numpy"}
 
 
 def test_arithmetic():
@@ -196,3 +197,21 @@ def test_spec_document_matches_the_code():
     graph = Graph.loads(embedded)
     assert analyze(graph).ok and run(graph)["sum"] == 2.5
     assert graph.dumps() == embedded
+
+
+def test_numpy_histogram_example():
+    graph = Graph.load(EXAMPLES / "numpy_histogram.json")
+    assert graph.imports == ["numpy"]
+    result = run(graph)
+    wave = np.sin(np.linspace(0.0, 2 * np.pi, 200))
+    hist, edges = np.histogram(wave, bins=4)
+    assert result["histogram", "hist"].tolist() == hist.tolist()
+    assert np.allclose(result["histogram", "bin_edges"], edges)
+    assert result["total"] == 200 and result["fullest_bin"] == int(np.argmax(hist))
+    assert result["levels", "counts"].tolist() == [66, 68, 66]
+
+
+def test_command_line_runs_a_graph_with_imports(capsys):
+    assert main(["run", str(EXAMPLES / "numpy_histogram.json"), "--node", "total"]) == 0
+    assert capsys.readouterr().out == "total.out = 200\n"
+    assert main(["check", str(EXAMPLES / "numpy_histogram.json")]) == 0

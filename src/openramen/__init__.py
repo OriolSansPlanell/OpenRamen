@@ -12,10 +12,11 @@ The public surface of the headless core::
 """
 
 from . import types
-from .check import Analysis, GraphCheckError, Problem, analyze
+from .check import Analysis, GraphCheckError, Problem, analyze, registry_for
 from .library import (
-    MISSING, NodeSpec, PinSpec, Registry, SpecError, UnknownSpecError,
-    default_registry, spec_from_function,
+    DEFAULT, MISSING, ImportFailure, NodeSpec, PinSpec, Registry, SpecError,
+    UnknownSpecError, default_registry, import_callable, import_module, pin_outputs,
+    spec_from_function,
 )
 from .model import CycleError, Graph, GraphError, Node, Wire
 from .runtime import Event, NodeError, Plan, RunResult, compile_graph, run
@@ -25,8 +26,9 @@ __version__ = "0.1.0.dev0"
 __all__ = [
     "types", "Graph", "Node", "Wire", "GraphError", "CycleError",
     "NodeSpec", "PinSpec", "Registry", "MISSING", "SpecError", "UnknownSpecError",
-    "default_registry", "spec_from_function",
-    "analyze", "Analysis", "Problem", "GraphCheckError",
+    "default_registry", "spec_from_function", "DEFAULT", "ImportFailure",
+    "import_callable", "import_module", "pin_outputs",
+    "analyze", "Analysis", "Problem", "GraphCheckError", "registry_for",
     "run", "compile_graph", "Plan", "RunResult", "Event", "NodeError",
     "__version__",
 ]

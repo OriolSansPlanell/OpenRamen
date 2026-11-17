@@ -86,9 +86,27 @@ One immutable record per kind of node (`openramen.library.NodeSpec`).
 | `tier` | `auto`, `annotated`, `curated` | How much the spec can be trusted. Outputs of non-curated nodes are checked against their declared type on every run |
 | `infer` | callable | Optional type hook: `infer(input_types, config) -> {output: Type}` |
 
-PinSpec fields: `name`, `type`, `default` (`MISSING` means required), `doc`,
-`access` (`read` or `mutate`), `aliases` (outputs: the input it shares memory
-with), `widget`, `kind` (`keyword` or `positional`), `hidden`.
+PinSpec fields: `name`, `type`, `default`, `doc`, `access` (`read` or
+`mutate`), `aliases` (outputs: the input it shares memory with), `widget`,
+`kind`, `hidden`, and `source` (where the type came from: `annotation`,
+`docstring`, `default`, `override` or `observed`).
+
+`default` is a value, or one of two markers: `MISSING` (the input is
+required) and `DEFAULT` (optional, but the default value is not known, so the
+input is only passed when it is wired).
+
+`kind` says how an input reaches the function, in the order Python allows:
+
+| Kind | Python parameter | On a node |
+| --- | --- | --- |
+| `positional` | positional-only | A pin |
+| `keyword` | ordinary | A pin |
+| `var_positional` | `*args` | Grows: pins `args_0`, `args_1`, ... numbered without gaps |
+| `keyword_only` | after `*` | A pin |
+| `var_keyword` | `**kwargs` | Grows: any other identifier becomes a keyword pin |
+
+Arguments are passed by position for as long as no pin is left out, then by
+keyword. The type of a growable pin is the type of one element.
 
 `access`, `aliases`, `thread_safe`, `executor`, `widget` and `hidden` are
 recorded now and acted on by later milestones (copy rules, scheduler, panel).
@@ -113,6 +131,9 @@ and everything sorted, so that files diff and merge under git.
 }
 ```
 
+- `imports` (optional): Python modules whose functions the graph uses as
+  nodes, e.g. `["numpy", "scipy.ndimage"]`. They are imported when the graph
+  is checked or run, never when the file is loaded.
 - `nodes[].id`: an identifier, unique in the graph. `spec`: a NodeSpec id.
 - `values`: literals for unwired inputs. `config`: configuration values.
 - `pos` and `label` are optional and only matter to the editor.
@@ -144,9 +165,11 @@ Anything else cannot be stored as a literal and must come from a node.
 
 | Code | Meaning |
 | --- | --- |
+| `bad-import` | A module listed in the graph's `imports` cannot be imported |
 | `unknown-spec` | The node's spec id is not registered |
 | `unknown-pin`, `unknown-config` | A wire, literal or config value names a pin the spec does not have |
 | `missing-input`, `missing-config` | A required pin has no wire and no value |
+| `variadic-gap` | Grown pins `args_0`, `args_1`, ... are not numbered consecutively |
 | `bad-literal`, `bad-config` | A stored value does not fit its pin |
 | `type-conflict` | A type variable would need two unrelated types |
 | `type-mismatch` | A wire is `INCOMPATIBLE` |
@@ -161,9 +184,88 @@ never depends on editing history. Guarantees:
 - A failure raises `NodeError` naming the node, with the original exception as its cause. Nothing downstream runs.
 - A listener receives `graph-started`, `node-started`, `node-finished`, `node-failed`, `graph-finished` or `graph-failed`.
 
-## 5. Not specified yet
+## 5. Importing Python functions
+
+`registry.import_module("numpy")` makes every public function of a module a
+node with the id `<module>.<function>`. Specs are built lazily, the first
+time each is used. The importer never calls the functions it imports;
+importing the module itself runs that module's top-level code, as `import`
+does.
+
+For each function the importer needs a signature and types.
+
+**Signature**, first that works: `inspect.signature`; the structure of a
+NumPy ufunc; a `name(a, b=1)` line at the top of the docstring.
+
+**Type of an input**, first that gives one:
+
+1. An override (see below).
+2. The annotation.
+3. The docstring, in numpydoc, Google or reST style. A phrase is only used
+   when all of it is understood: `int or tuple of ints` gives a type, `int or
+   MyClass` gives `Any`. A type that is too narrow would reject correct wiring.
+4. A default that is a boolean, number or text.
+5. Otherwise `Any`.
+
+Whatever the source, a pin always accepts its own default: `x : int,
+optional` with `x=None` is `Optional[Int]`.
+
+**Outputs.** One output named `out` takes the whole result, unless the
+Returns section lists several named values that are always returned: then
+each is a pin. Documented arrays are typed "array or scalar", because NumPy
+returns a scalar for 0-d results. ufuncs get exact types by sampling.
+
+**Flags that add results** (`return_counts`, `retstep`, `full_output`, ...)
+become configuration instead of pins, so the checker knows their value: with
+all flags off the output has the documented type, otherwise it is `Any`.
+
+**Heuristics**, all correctable by an override:
+
+- Optional keyword-only parameters, and plumbing such as `out`, `where`,
+  `order`, start hidden.
+- An `out` parameter, and the first input of a function whose summary says
+  "in-place", are marked `mutate`.
+- Functions in a `random` module, or named like `save...`, `load...`,
+  `read...`, are marked impure.
+
+Imported nodes have tier `auto`. Their outputs are checked against the
+declared type on every run; a mismatch names the node and the pin.
+
+### Override files
+
+A TOML file per library corrects what introspection gets wrong. Tables are
+named by function, relative to the library: `[histogram]`, `["linalg.norm"]`.
+OpenRamen bundles such "node packs" in `src/openramen/packs/`; your own file
+goes on top with `import_module(..., overrides="mine.toml")`.
+
+| Key | Meaning |
+| --- | --- |
+| `types` | Table of pin name to type text, inputs and outputs alike |
+| `outputs` | List of output pins, `"name"` or `"name: Type"`. Replaces what was found; `[]` means no outputs |
+| `config` | Parameters that are configuration, not pins |
+| `hidden`, `shown` | Force optional inputs to start hidden or visible |
+| `mutates` | Inputs the function writes to |
+| `aliases` | Table of output to the input it shares memory with |
+| `category`, `summary`, `pure`, `thread_safe`, `executor` | The NodeSpec fields of the same name |
+| `signature` | The signature to use, as text: `"arange(start, stop=None, step=1)"`. For functions whose own cannot be read |
+| `skip` | `true` leaves the function out |
+| `function`, `presets` | A variant: this table is a node of its own that calls `function` with the arguments in `presets` fixed |
+
+A node touched by an override has tier `annotated`.
+
+### Observed types
+
+After a run, `result.observed(node)` gives the types a node's outputs really
+had, and `pin_outputs(registry, spec_id, types)` makes them the declared
+types. From then on they are checked on every run.
+
+## 6. Not specified yet
 
 Structures (loops, cases, subgraphs), copy-on-branch rules, parallel
-executors, caching, the importer and the front panel. Each gets its section
-here when its milestone lands. Until copy rules exist, a node that modifies a
-wired input in place can affect other readers of that value.
+executors, caching and the front panel. Each gets its section here when its
+milestone lands. Until copy rules exist, a node that modifies a wired input
+in place can affect other readers of that value.
+
+Still open in the importer: classes and their methods, reading stub files
+(`.pyi`), a disk cache of built specs, and flagging nodes whose function
+changed between library versions.

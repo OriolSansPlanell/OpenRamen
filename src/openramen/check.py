@@ -11,10 +11,10 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import types as T
-from .library import MISSING, NodeSpec, Registry, default_registry
+from .library import DEFAULT, MISSING, NodeSpec, PinSpec, Registry, default_registry
 from .model import CycleError, Graph, Wire
 
-__all__ = ["Problem", "NodeInfo", "Analysis", "analyze", "GraphCheckError"]
+__all__ = ["Problem", "NodeInfo", "Analysis", "analyze", "GraphCheckError", "registry_for"]
 
 
 @dataclass(frozen=True)
@@ -89,21 +89,34 @@ class Analysis:
             raise GraphCheckError(self.errors)
 
 
-_base: Optional[Registry] = None
+_registries: dict[tuple[str, ...], Registry] = {}
 
 
-def _registry(registry: Optional[Registry]) -> Registry:
-    global _base
-    if registry is not None:
-        return registry
-    if _base is None:
-        _base = default_registry()
-    return _base
+def registry_for(graph: Graph) -> Registry:
+    """The registry a graph asks for: the base palette plus its ``imports``.
+
+    This imports the listed Python modules, which runs their top-level code.
+    """
+    key = tuple(sorted(set(graph.imports)))
+    registry = _registries.get(key)
+    if registry is None:
+        registry = default_registry()
+        for module in key:
+            registry.import_module(module)
+        _registries[key] = registry
+    return registry
+
+
+def _registry(registry: Optional[Registry], graph: Graph) -> Registry:
+    return registry if registry is not None else registry_for(graph)
 
 
 def analyze(graph: Graph, registry: Optional[Registry] = None) -> Analysis:
     """Check a graph and resolve the type of every pin."""
-    registry = _registry(registry)
+    try:
+        registry = _registry(registry, graph)
+    except Exception as exc:        # a module named in the graph's imports is unusable
+        return Analysis([], {}, [Problem("error", "bad-import", str(exc))])
     problems: list[Problem] = []
     nodes: dict[str, NodeInfo] = {}
 
@@ -127,17 +140,28 @@ def analyze(graph: Graph, registry: Optional[Registry] = None) -> Analysis:
             continue
         incoming = graph.incoming(nid)
 
-        # -- do the pins that are used exist?
-        for pin_name in incoming:
-            if spec.input(pin_name) is None:
-                error("unknown-pin", f"{node.spec} has no input {pin_name!r}", nid, pin_name)
+        # -- which inputs does this node have?  The declared pins, plus the
+        #    ones grown on a variadic function (args_0, args_1, ... and extra
+        #    keyword names).
+        slots: dict[str, PinSpec] = {p.name: p for p in spec.inputs if not p.variadic}
+        for name in sorted(set(incoming) | set(node.values)):
+            if name in slots:
+                continue
+            grown = spec.pin_for(name)
+            if grown is None:
+                error("unknown-pin", f"{node.spec} has no input {name!r}", nid, name)
+            else:
+                slots[name] = grown
+        numbered = sorted(i for i in map(spec.variadic_index, slots) if i is not None)
+        if numbered != list(range(len(numbered))):
+            pin_name = spec.var_positional.name if spec.var_positional else ""
+            error("variadic-gap",
+                  f"inputs {pin_name}_0, {pin_name}_1, ... must be numbered without gaps",
+                  nid, pin_name)
         for out_wire in graph.outgoing(nid):
             if spec.output(out_wire.src_pin) is None:
                 error("unknown-pin", f"{node.spec} has no output {out_wire.src_pin!r}",
                       nid, out_wire.src_pin)
-        for name in node.values:
-            if spec.input(name) is None:
-                error("unknown-pin", f"{node.spec} has no input {name!r}", nid, name)
         for name in node.config:
             if spec.config_pin(name) is None:
                 error("unknown-config", f"{node.spec} has no configuration {name!r}",
@@ -154,59 +178,61 @@ def analyze(graph: Graph, registry: Optional[Registry] = None) -> Analysis:
             elif pin.required:
                 error("missing-config", f"configuration {pin.name!r} is not set",
                       nid, pin.name)
-            else:
+            elif pin.default is not DEFAULT:
                 info.config[pin.name] = pin.default
 
         # -- what actually arrives at each input
         actual: dict[str, Optional[T.Type]] = {}
-        for pin in spec.inputs:
-            wire = incoming.get(pin.name)
+        for name, pin in slots.items():
+            wire = incoming.get(name)
             if wire is not None:
                 source = nodes.get(wire.src)
-                actual[pin.name] = T.ANY if source is None else source.out_types.get(
+                actual[name] = T.ANY if source is None else source.out_types.get(
                     wire.src_pin, T.ANY)
-            elif pin.name in node.values:
-                actual[pin.name] = T.type_of(T.plain_scalar(node.values[pin.name]))
+            elif name in node.values:
+                actual[name] = T.type_of(T.plain_scalar(node.values[name]))
+            elif pin.default is DEFAULT:
+                actual[name] = None          # optional, default value not known
             elif pin.default is not MISSING:
-                actual[pin.name] = T.type_of(pin.default)
+                actual[name] = T.type_of(pin.default)
             else:
-                actual[pin.name] = None
-                error("missing-input", f"input {pin.name!r} is not connected and has no value",
-                      nid, pin.name)
+                actual[name] = None
+                error("missing-input", f"input {name!r} is not connected and has no value",
+                      nid, name)
 
         # -- solve the node's type variables
         bindings: dict[str, Any] = {}
-        for pin in spec.inputs:
+        for name, pin in slots.items():
             try:
-                T.unify(pin.type, actual[pin.name], bindings)
+                T.unify(pin.type, actual[name], bindings)
             except T.UnifyError as exc:
-                error("type-conflict", f"input {pin.name!r}: {exc}", nid, pin.name)
-        info.in_types = {p.name: T.substitute(p.type, bindings) for p in spec.inputs}
+                error("type-conflict", f"input {name!r}: {exc}", nid, name)
+        info.in_types = {name: T.substitute(pin.type, bindings) for name, pin in slots.items()}
         info.out_types = {p.name: T.substitute(p.type, bindings) for p in spec.outputs}
 
         # -- do the wires and literals fit?  What does each pin really receive?
         received: dict[str, Optional[T.Type]] = {}
-        for pin in spec.inputs:
-            wanted = info.in_types[pin.name]
-            source_type = actual[pin.name]
-            received[pin.name] = source_type
-            wire = incoming.get(pin.name)
+        for name in slots:
+            wanted = info.in_types[name]
+            source_type = actual[name]
+            received[name] = source_type
+            wire = incoming.get(name)
             if wire is not None:
                 assert source_type is not None
                 compat = T.check(source_type, wanted)
-                info.wires[pin.name] = (wire, compat)
+                info.wires[name] = (wire, compat)
                 if compat.ok:
-                    received[pin.name] = T.delivered(source_type, wanted, compat)
+                    received[name] = T.delivered(source_type, wanted, compat)
                 else:
-                    error("type-mismatch", f"wire {wire}: {compat.reason}", nid, pin.name)
-            elif pin.name in node.values:
+                    error("type-mismatch", f"wire {wire}: {compat.reason}", nid, name)
+            elif name in node.values:
                 try:
-                    literal = T.accept(T.plain_scalar(node.values[pin.name]), wanted)
+                    literal = T.accept(T.plain_scalar(node.values[name]), wanted)
                 except T.TypeMismatch as exc:
-                    error("bad-literal", f"value of input {pin.name!r}: {exc}", nid, pin.name)
+                    error("bad-literal", f"value of input {name!r}: {exc}", nid, name)
                 else:
-                    info.literals[pin.name] = literal
-                    received[pin.name] = T.type_of(literal)
+                    info.literals[name] = literal
+                    received[name] = T.type_of(literal)
 
         # -- polymorphic nodes compute their output types from what they receive
         if spec.infer is not None:

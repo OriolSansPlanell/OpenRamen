@@ -1,0 +1,23 @@
+{
+  "format": "openramen.graph",
+  "version": 1,
+  "name": "NumPy nodes: histogram of a sine wave",
+  "imports": ["numpy"],
+  "nodes": [
+    {"id": "fullest_bin", "spec": "numpy.argmax"},
+    {"id": "histogram", "spec": "numpy.histogram", "values": {"bins": 4}},
+    {"id": "levels", "spec": "numpy.unique_counts"},
+    {"id": "rounded", "spec": "numpy.round", "values": {"decimals": 0}},
+    {"id": "total", "spec": "numpy.sum"},
+    {"id": "wave", "spec": "numpy.sin"},
+    {"id": "x", "spec": "numpy.linspace", "values": {"num": 200, "start": 0.0, "stop": 6.283185307179586}}
+  ],
+  "wires": [
+    ["histogram", "hist", "fullest_bin", "a"],
+    ["histogram", "hist", "total", "a"],
+    ["rounded", "out", "levels", "x"],
+    ["wave", "out", "histogram", "a"],
+    ["wave", "out", "rounded", "a"],
+    ["x", "out", "wave", "x"]
+  ]
+}

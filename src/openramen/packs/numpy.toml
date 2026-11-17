@@ -1,0 +1,199 @@
+# OpenRamen node pack for NumPy.
+#
+# The importer reads signatures and docstrings; this file only records what
+# they get wrong or cannot say.  One table per function, named relative to
+# "numpy" ("histogram", "linalg.norm").  See docs/spec.md, "Override files".
+
+# ---- documentation that disagrees with the code ---------------------------
+
+[histogramdd]
+outputs = ["H: Array", "edges: List[Array]"]   # documented as a tuple, is a list
+
+[where]
+signature = "where(condition, x=None, y=None, /)"
+# with only a condition it returns a tuple of index arrays, like nonzero
+types = { out = "Union[Array, Bool, Int, Float, Complex, Tuple[Array, ...]]" }
+
+[diff]
+# n = 0 hands the input back untouched, whatever it was
+types = { out = "Union[Array, Bool, Int, Float, Complex, List, Tuple]" }
+
+# ---- signatures that cannot be read on every NumPy version ----------------
+# Older NumPy only documents these in a form that is not a Python signature
+# ("arange([start,] stop[, step,])").  Fixing them here also keeps the pin
+# names the same across NumPy versions.
+
+[arange]
+signature = "arange(start_or_stop, /, stop=None, step=1, *, dtype=None, device=None, like=None)"
+
+["random.rand"]
+signature = "rand(*args)"
+
+["random.randn"]
+signature = "randn(*args)"
+
+# ---- results that are named tuples: one pin per field ---------------------
+
+[unique_all]
+outputs = ["values: Array", "indices: Array", "inverse_indices: Array", "counts: Array"]
+
+[unique_counts]
+outputs = ["values: Array", "counts: Array"]
+
+[unique_inverse]
+outputs = ["values: Array", "inverse_indices: Array"]
+
+# ---- variants: one function, several fixed sets of outputs ----------------
+# A flag that adds return values cannot be a wire: the number of output pins
+# would depend on a value.  Each useful combination is a node of its own.
+
+[linspace_step]
+function = "linspace"
+presets = { retstep = true }
+outputs = ["samples: Array", "step: Union[Float, Complex, Array]"]
+summary = "Evenly spaced numbers over an interval, and the spacing between them."
+
+[intersect1d_indices]
+function = "intersect1d"
+presets = { return_indices = true }
+outputs = ["values: Array[_, 1]", "index1: Array[_, 1]", "index2: Array[_, 1]"]
+summary = "Sorted common elements of two arrays and where they occur in each."
+
+[average_weights]
+function = "average"
+presets = { returned = true }
+outputs = ["average: Union[Bool, Int, Float, Complex, Array]", "sum_of_weights: Union[Bool, Int, Float, Complex, Array]"]
+summary = "Weighted average along an axis, and the sum of the weights."
+
+# ---- results that share memory with an input (views) ----------------------
+# Recorded now, acted on by the copy rules of milestone 3.
+
+[reshape]
+aliases = { out = "a" }
+
+[ravel]
+aliases = { out = "a" }
+
+[transpose]
+aliases = { out = "a" }
+
+[squeeze]
+aliases = { out = "a" }
+
+[expand_dims]
+aliases = { out = "a" }
+
+[swapaxes]
+aliases = { out = "a" }
+
+[moveaxis]
+aliases = { out = "a" }
+
+[flip]
+aliases = { out = "m" }
+
+[fliplr]
+aliases = { out = "m" }
+
+[flipud]
+aliases = { out = "m" }
+
+[rot90]
+aliases = { out = "m" }
+
+[diagonal]
+aliases = { out = "a" }
+
+[broadcast_to]
+aliases = { out = "array" }
+
+[asarray]
+aliases = { out = "a" }
+
+[atleast_1d]
+types = { out = "Union[Array, Tuple[Array, ...]]" }
+
+[atleast_2d]
+types = { out = "Union[Array, Tuple[Array, ...]]" }
+
+[atleast_3d]
+types = { out = "Union[Array, Tuple[Array, ...]]" }
+
+[real]
+aliases = { out = "val" }
+
+[imag]
+aliases = { out = "val" }
+
+# ---- functions that write into an argument --------------------------------
+
+[fill_diagonal]
+mutates = ["a"]
+pure = false
+outputs = []
+
+[put]
+mutates = ["a"]
+pure = false
+outputs = []
+
+[place]
+mutates = ["arr"]
+pure = false
+outputs = []
+
+[putmask]
+mutates = ["a"]
+pure = false
+outputs = []
+
+[copyto]
+mutates = ["dst"]
+pure = false
+outputs = []
+
+[put_along_axis]
+mutates = ["arr"]
+pure = false
+outputs = []
+
+# ---- not data nodes --------------------------------------------------------
+
+[show_config]
+skip = true
+
+[show_runtime]
+skip = true
+
+[info]
+skip = true
+
+[test]
+skip = true
+
+[get_include]
+skip = true
+
+[seterr]
+skip = true
+
+[geterr]
+skip = true
+
+[seterrcall]
+skip = true
+
+[geterrcall]
+skip = true
+
+[setbufsize]
+skip = true
+
+[getbufsize]
+skip = true
+
+[set_printoptions]
+skip = true
+
+[get_printoptions]
+skip = true

@@ -28,6 +28,7 @@ FORMAT = "openramen.graph"
 VERSION = 1
 
 _ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
 
 
 class GraphError(Exception):
@@ -85,6 +86,9 @@ class Graph:
 
     def __init__(self, name: str = "") -> None:
         self.name = name
+        #: Python modules whose functions this graph uses as nodes.  They are
+        #: imported when the graph is checked or run, never when it is loaded.
+        self.imports: list[str] = []
         self._nodes: dict[str, Node] = {}
         self._in: dict[str, dict[str, Wire]] = {}    # dst -> dst_pin -> wire
         self._out: dict[str, set[Wire]] = {}         # src -> wires
@@ -252,6 +256,7 @@ class Graph:
 
     def copy(self) -> "Graph":
         clone = Graph(self.name)
+        clone.imports = list(self.imports)
         for node in self._nodes.values():
             clone._nodes[node.id] = Node(node.id, node.spec, copy.deepcopy(node.values),
                                          copy.deepcopy(node.config), node.pos, node.label)
@@ -289,10 +294,14 @@ class Graph:
             if node.label:
                 item["label"] = node.label
             nodes.append(item)
+        for module in self.imports:
+            if not isinstance(module, str) or not _MODULE.match(module):
+                raise GraphError(f"invalid module name {module!r} in imports")
         return {
             "format": FORMAT,
             "version": VERSION,
             "name": self.name,
+            "imports": sorted(set(self.imports)),
             "nodes": nodes,
             "wires": [[w.src, w.src_pin, w.dst, w.dst_pin] for w in self.wires],
         }
@@ -312,6 +321,11 @@ class Graph:
         if not isinstance(name, str):
             raise GraphError("graph name must be a string")
         graph = cls(name)
+        imports = data.get("imports", [])
+        if not isinstance(imports, list) or not all(
+                isinstance(m, str) and _MODULE.match(m) for m in imports):
+            raise GraphError("'imports' must be a list of module names")
+        graph.imports = sorted(set(imports))
         nodes = data.get("nodes", [])
         wires = data.get("wires", [])
         if not isinstance(nodes, list) or not isinstance(wires, list):
@@ -362,6 +376,7 @@ class Graph:
             f'  "format": {line(data["format"])},\n'
             f'  "version": {line(data["version"])},\n'
             f'  "name": {line(data["name"])},\n'
+            + (f'  "imports": {line(data["imports"])},\n' if data["imports"] else "") +
             f'  "nodes": {block(data["nodes"])},\n'
             f'  "wires": {block(data["wires"])}\n'
             "}\n"

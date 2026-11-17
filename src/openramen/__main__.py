@@ -1,4 +1,4 @@
-"""Command line: ``python -m openramen {check,run,nodes} ...``."""
+"""Command line: ``python -m openramen {check,run,nodes,import} ...``."""
 
 from __future__ import annotations
 
@@ -69,6 +69,25 @@ def _nodes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _import(args: argparse.Namespace) -> int:
+    from .library import ImportFailure, Registry, import_module, report
+    registry = Registry()
+    try:
+        library = import_module(registry, args.module, pack=not args.no_pack)
+    except ImportFailure as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    summary = report(library)
+    if args.list:
+        for spec in registry:
+            print(f"{spec.id:<36} {spec.summary}")
+        return 0
+    print("\n".join(summary.lines()))
+    for name, reason in sorted(summary.failures.items()):
+        print(f"  not imported: {name}: {reason}")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="openramen", description=__doc__)
     parser.add_argument("--version", action="version", version=f"openramen {__version__}")
@@ -83,6 +102,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_run.set_defaults(func=_run)
     p_nodes = sub.add_parser("nodes", help="list the base palette")
     p_nodes.set_defaults(func=_nodes)
+    p_import = sub.add_parser(
+        "import", help="show what importing a Python module as nodes gives")
+    p_import.add_argument("module", help="e.g. numpy or scipy.ndimage")
+    p_import.add_argument("--list", action="store_true", help="list the nodes instead")
+    p_import.add_argument("--no-pack", action="store_true",
+                          help="ignore the overrides bundled with OpenRamen")
+    p_import.set_defaults(func=_import)
     args = parser.parse_args(argv)
     return args.func(args)
 

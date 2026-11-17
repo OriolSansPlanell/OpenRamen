@@ -15,7 +15,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .. import types as T
 
-__all__ = ["MISSING", "PinSpec", "NodeSpec", "SpecError", "NodeResultError",
+__all__ = ["MISSING", "DEFAULT", "PinSpec", "NodeSpec", "SpecError", "NodeResultError",
            "spec_from_function"]
 
 
@@ -55,8 +55,40 @@ class _Missing:
 
 MISSING = _Missing()
 
+
+class _Default:
+    """Sentinel for "optional, but the default value itself is not known".
+
+    Signatures recovered from documentation often show a default that cannot
+    be evaluated.  Such an input is simply never passed unless it is wired.
+    """
+
+    _instance: "Optional[_Default]" = None
+
+    def __new__(cls) -> "_Default":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "DEFAULT"
+
+    def __copy__(self) -> "_Default":
+        return self
+
+    def __deepcopy__(self, memo: dict) -> "_Default":
+        return self
+
+    def __reduce__(self) -> str:
+        return "DEFAULT"
+
+
+DEFAULT = _Default()
+
 _ACCESS = ("read", "mutate")
-_KINDS = ("keyword", "positional")
+#: How an input reaches the function, in the order Python allows them.
+_KINDS = ("positional", "keyword", "var_positional", "keyword_only", "var_keyword")
+_VARIADIC = ("var_positional", "var_keyword")
 _EXECUTORS = ("inline", "thread", "process")
 _TIERS = ("auto", "annotated", "curated")
 
@@ -78,6 +110,7 @@ class PinSpec:
     widget: Optional[str] = None     # front-panel hint
     kind: str = "keyword"            # how the argument is passed to the function
     hidden: bool = False             # optional input not shown until asked for
+    source: str = ""                 # where the type came from: annotation, docstring, ...
 
     def __post_init__(self) -> None:
         if not _valid_name(self.name):
@@ -91,7 +124,11 @@ class PinSpec:
 
     @property
     def required(self) -> bool:
-        return self.default is MISSING
+        return self.default is MISSING and self.kind not in _VARIADIC
+
+    @property
+    def variadic(self) -> bool:
+        return self.kind in _VARIADIC
 
 
 @dataclass(frozen=True)
@@ -138,13 +175,17 @@ class NodeSpec:
             if pin.aliases is not None and pin.aliases not in {p.name for p in self.inputs}:
                 raise SpecError(
                     f"{self.id}: output {pin.name!r} aliases unknown input {pin.aliases!r}")
-        seen_keyword = False
-        for pin in self.inputs:
-            if pin.kind == "keyword":
-                seen_keyword = True
-            elif seen_keyword:
+        previous = self.inputs[0] if self.inputs else None
+        for pin in self.inputs[1:]:
+            assert previous is not None
+            if _KINDS.index(pin.kind) < _KINDS.index(previous.kind):
                 raise SpecError(
-                    f"{self.id}: positional input {pin.name!r} follows a keyword input")
+                    f"{self.id}: {pin.kind} input {pin.name!r} follows a "
+                    f"{previous.kind} input")
+            previous = pin
+        for kind in _VARIADIC:
+            if sum(pin.kind == kind for pin in self.inputs) > 1:
+                raise SpecError(f"{self.id}: more than one {kind} input")
         for pin in self.config:
             if pin.kind != "keyword":
                 raise SpecError(f"{self.id}: config pin {pin.name!r} must be a keyword")
@@ -167,6 +208,43 @@ class NodeSpec:
 
     def config_pin(self, name: str) -> Optional[PinSpec]:
         return next((p for p in self.config if p.name == name), None)
+
+    @property
+    def var_positional(self) -> Optional[PinSpec]:
+        """The ``*args`` pin, if the function has one."""
+        return next((p for p in self.inputs if p.kind == "var_positional"), None)
+
+    @property
+    def var_keyword(self) -> Optional[PinSpec]:
+        """The ``**kwargs`` pin, if the function has one."""
+        return next((p for p in self.inputs if p.kind == "var_keyword"), None)
+
+    def variadic_index(self, name: str) -> Optional[int]:
+        """``2`` for the pin name ``args_2`` when ``args`` is the ``*args`` pin."""
+        pin = self.var_positional
+        if pin is None or not name.startswith(pin.name + "_"):
+            return None
+        digits = name[len(pin.name) + 1:]
+        if not digits.isdigit() or (len(digits) > 1 and digits[0] == "0"):
+            return None
+        return int(digits)
+
+    def pin_for(self, name: str) -> Optional[PinSpec]:
+        """The pin that governs a wirable input name on a node.
+
+        Besides the declared inputs this covers growable pins: ``args_0``,
+        ``args_1``... feed ``*args``, and any other identifier feeds
+        ``**kwargs`` when the function accepts them.
+        """
+        declared = self.input(name)
+        if declared is not None:
+            return None if declared.variadic else declared
+        if self.variadic_index(name) is not None:
+            return self.var_positional
+        extra = self.var_keyword
+        if extra is not None and _valid_name(name) and self.config_pin(name) is None:
+            return extra
+        return None
 
     # -- calling ------------------------------------------------------------
 
@@ -196,22 +274,56 @@ class NodeSpec:
         input left out falls back to the function's own default.
         """
         fn = self.resolve()
-        args: list[Any] = []
+        extras: dict[int, Any] = {}
         kwargs: dict[str, Any] = {}
+        for name, value in inputs.items():
+            declared = self.input(name)
+            if declared is not None and not declared.variadic:
+                continue
+            index = self.variadic_index(name)
+            if index is not None:
+                extras[index] = value
+            elif self.pin_for(name) is not None:
+                kwargs[name] = value
+            else:
+                raise TypeError(f"{self.id}: no input named {name!r}")
+        if sorted(extras) != list(range(len(extras))):
+            raise TypeError(
+                f"{self.id}: variadic inputs must be numbered 0, 1, 2... without gaps")
+
+        # Arguments go in by position for as long as there is no gap: that is
+        # valid for every parameter that is not keyword-only, and it also
+        # works for functions whose reported signature hides that a parameter
+        # is positional-only.  After the first gap the rest go by keyword.
+        # ``*args`` can only be reached with no gap at all, so then every
+        # parameter before it needs a value or a known default.
+        fill = bool(extras)
+        args: list[Any] = []
         gap: Optional[str] = None
         for pin in self.inputs:
-            if pin.name not in inputs:
-                if pin.kind == "positional":
-                    gap = gap or pin.name
+            if pin.variadic:
                 continue
-            if pin.kind == "positional":
-                if gap is not None:
-                    raise TypeError(
-                        f"{self.id}: positional input {pin.name!r} is set but "
-                        f"{gap!r} before it is not")
+            given = pin.name in inputs
+            if pin.kind == "keyword_only":
+                if given:
+                    kwargs[pin.name] = inputs[pin.name]
+            elif given and gap is None:
                 args.append(inputs[pin.name])
-            else:
+            elif given and pin.kind == "keyword":
                 kwargs[pin.name] = inputs[pin.name]
+            elif given:
+                raise TypeError(
+                    f"{self.id}: positional input {pin.name!r} is set but "
+                    f"{gap!r} before it is not")
+            elif fill and pin.default is not MISSING and pin.default is not DEFAULT:
+                args.append(pin.default)
+            elif fill:
+                raise TypeError(
+                    f"{self.id}: input {pin.name!r} needs a value before the "
+                    "variadic inputs can be passed")
+            else:
+                gap = gap or pin.name
+        args.extend(extras[i] for i in range(len(extras)))
         for pin in self.config:
             if config is not None and pin.name in config:
                 kwargs[pin.name] = config[pin.name]
@@ -239,6 +351,16 @@ class NodeSpec:
         raise NodeResultError(
             f"{self.id}: returned {type(result).__name__} for {count} outputs; "
             "expected a tuple")
+
+
+#: PinSpec kind for each kind of Python parameter.
+PARAMETER_KINDS = {
+    inspect.Parameter.POSITIONAL_ONLY: "positional",
+    inspect.Parameter.POSITIONAL_OR_KEYWORD: "keyword",
+    inspect.Parameter.VAR_POSITIONAL: "var_positional",
+    inspect.Parameter.KEYWORD_ONLY: "keyword_only",
+    inspect.Parameter.VAR_KEYWORD: "var_keyword",
+}
 
 
 def _first_line(doc: Optional[str]) -> str:
@@ -317,19 +439,24 @@ def spec_from_function(
 
     inputs: list[PinSpec] = []
     config_pins: list[PinSpec] = []
+    has_var_positional = any(
+        p.kind is p.VAR_POSITIONAL for p in signature.parameters.values())
+    removed = False
     for name, param in signature.parameters.items():
-        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
-            raise SpecError(
-                f"{getattr(fn, '__name__', fn)!s}: variadic parameter "
-                f"{name!r} is not supported yet")
         default = MISSING if param.default is param.empty else param.default
-        kind = "positional" if param.kind is param.POSITIONAL_ONLY else "keyword"
+        kind = PARAMETER_KINDS[param.kind]
         ptype = pin_type(name, default)
         if name in config:
-            if kind != "keyword":
-                raise SpecError(f"config parameter {name!r} cannot be positional-only")
+            if kind not in ("keyword", "keyword_only") or (
+                    kind == "keyword" and has_var_positional):
+                raise SpecError(
+                    f"config parameter {name!r} must be one that can always be "
+                    "passed by keyword")
             config_pins.append(PinSpec(name, ptype, default, docs.get(name, "")))
+            removed = True
         else:
+            if removed and kind == "keyword":
+                kind = "keyword_only"   # its position is gone with the config parameter
             inputs.append(PinSpec(
                 name, ptype, default, docs.get(name, ""),
                 access="mutate" if name in mutates else "read", kind=kind))

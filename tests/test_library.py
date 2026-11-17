@@ -74,6 +74,11 @@ class TestNodeSpec:
         (dict(outputs=(PinSpec("o"), PinSpec("o"))), "duplicate output"),
         (dict(outputs=(PinSpec("o", aliases="nope"),)), "aliases unknown input"),
         (dict(inputs=(PinSpec("a"), PinSpec("b", kind="positional"))), "follows a keyword"),
+        (dict(inputs=(PinSpec("a", kind="keyword_only"), PinSpec("b"))), "follows a keyword_only"),
+        (dict(inputs=(PinSpec("k", kind="var_keyword"), PinSpec("a", kind="var_positional"))),
+         "follows a var_keyword"),
+        (dict(inputs=(PinSpec("a", kind="var_positional"), PinSpec("b", kind="var_positional"))),
+         "more than one var_positional"),
         (dict(config=(PinSpec("c", kind="positional"),)), "must be a keyword"),
         (dict(executor="gpu"), "executor"),
         (dict(tier="gold"), "tier"),
@@ -110,7 +115,7 @@ class TestCalling:
         def f(a, b=2, /, c=3, *, d=4):
             return (a, b, c, d)
         s = spec_from_function(f, "t.pos")
-        assert [p.kind for p in s.inputs] == ["positional", "positional", "keyword", "keyword"]
+        assert [p.kind for p in s.inputs] == ["positional", "positional", "keyword", "keyword_only"]
         assert s.call({"a": 1})["out"] == (1, 2, 3, 4)
         assert s.call({"a": 1, "b": 9, "d": 7})["out"] == (1, 9, 3, 7)
         with pytest.raises(TypeError, match="'a' before it is not"):
@@ -251,23 +256,14 @@ class TestSpecFromFunction:
         assert (s.category, s.pure, s.executor, s.tier) == ("Lists", False, "inline", "annotated")
 
     def test_errors(self):
-        def variadic(*args):
-            return args
-
-        def keywords(**kwargs):
-            return kwargs
-
         def f(a, /, b):
             return a
 
-        for fn in (variadic, keywords):
-            with pytest.raises(SpecError, match="variadic"):
-                spec_from_function(fn, "t.v")
         with pytest.raises(SpecError, match="no parameter named"):
             spec_from_function(f, "t.f", config=("zzz",))
         with pytest.raises(SpecError, match="no parameter named"):
             spec_from_function(f, "t.f", mutates=("zzz",))
-        with pytest.raises(SpecError, match="positional-only"):
+        with pytest.raises(SpecError, match="passed by keyword"):
             spec_from_function(f, "t.f", config=("a",))
         with pytest.raises(SpecError):
             spec_from_function(42, "t.f")  # type: ignore[arg-type]

@@ -24,6 +24,9 @@ import numpy as np
 from .. import types as T
 from ..types import ANY, BOOL, COMPLEX, FLOAT, INT, STR, ArrayT, ListT, TupleT
 from .registry import Registry
+from .sampling import SAMPLES as _SAMPLES
+from .sampling import result_type as _result_type
+from .sampling import scalar_of as _scalar_of
 from .spec import spec_from_function
 
 __all__ = ["register", "NUMBER", "REAL", "ORDERABLE"]
@@ -50,81 +53,12 @@ def _add(fn: Callable[..., Any], name: str, category: str, **options: Any) -> No
 # Type inference by sampling
 # --------------------------------------------------------------------------
 
-# Sample values avoid 0, 1, 2 and 0.5, which some operations treat specially.
-_SAMPLES: dict[T.Type, Any] = {INT: 3, FLOAT: 3.0, COMPLEX: 3j, BOOL: True, STR: "a"}
-
-
-def _sample(t: T.Type) -> Any:
-    """A tiny value of type ``t``, or ``None`` if the type is not specific."""
-    if t in _SAMPLES:
-        return _SAMPLES[t]
-    if isinstance(t, ArrayT) and isinstance(t.dtype, str):
-        try:
-            dtype = np.dtype(t.dtype)
-        except TypeError:
-            return None
-        if dtype.kind not in "biufc":
-            return None
-        ndim = t.ndim if isinstance(t.ndim, int) else 1
-        return np.full((1,) * ndim, 3, dtype=dtype)
-    return None
-
-
-def _options(t: Optional[T.Type]) -> "list[T.Type] | None":
-    if t is None:
-        return None
-    return list(t.options) if isinstance(t, T.UnionT) else [t]
-
-
-def _result_type(fn: Callable[..., Any], *in_types: Optional[T.Type]) -> Optional[T.Type]:
-    """Type of ``fn`` applied to values of ``in_types``; ``None`` if unknown."""
-    per_input = [_options(t) for t in in_types]
-    if any(opts is None for opts in per_input):
-        return None
-    combos = list(itertools.islice(itertools.product(*per_input), 17))  # type: ignore[arg-type]
-    if len(combos) > 16:
-        return None
-    results = []
-    for combo in combos:
-        one = _result_type_one(fn, combo)
-        if one is None:
-            return None
-        results.append(one)
-    return T.union(*results)
-
-
-@functools.lru_cache(maxsize=4096)
-def _result_type_one(fn: Callable[..., Any], in_types: "tuple[T.Type, ...]") -> Optional[T.Type]:
-    samples = [_sample(t) for t in in_types]
-    if any(s is None for s in samples):
-        return None
-    try:
-        with np.errstate(all="ignore"):
-            out = fn(*samples)
-    except Exception:
-        return None
-    out_type = T.type_of(out)
-    if isinstance(out_type, ArrayT):
-        # The samples of arrays with unknown rank are 1-d: do not trust ndim.
-        if any(isinstance(t, ArrayT) and not isinstance(t.ndim, int) for t in in_types):
-            return ArrayT(out_type.dtype, None)
-    return out_type
-
-
 def _infer_with(fn: Callable[..., Any], *pins: str) -> Callable[..., Mapping[str, T.Type]]:
     def infer(inputs: Mapping[str, Optional[T.Type]], config: Mapping[str, Any]
               ) -> Mapping[str, T.Type]:
         result = _result_type(fn, *(inputs.get(p) for p in pins))
         return {} if result is None else {"out": result}
     return infer
-
-
-def _scalar_of(dtype: Any) -> T.Type:
-    try:
-        kind = np.dtype(dtype).kind
-    except TypeError:
-        return ANY
-    return {"b": BOOL, "i": INT, "u": INT, "f": FLOAT, "c": COMPLEX}.get(kind, ANY)
 
 
 # --------------------------------------------------------------------------

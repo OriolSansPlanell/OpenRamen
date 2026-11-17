@@ -106,6 +106,10 @@ class RunResult:
         """All outputs of one node, by pin name."""
         return {pin: self.values[(node, pin)] for pin in self._outputs[node]}
 
+    def observed(self, node: str) -> dict[str, T.Type]:
+        """The types the outputs of a node actually had in this run."""
+        return {pin: T.type_of(self.values[(node, pin)]) for pin in self._outputs[node]}
+
     def __repr__(self) -> str:
         return f"<RunResult: {len(self._outputs)} nodes>"
 
@@ -219,8 +223,11 @@ def _execute(step: Step, values: dict[tuple[str, str], Any],
     for pin, value in results.items():
         value = T.plain_scalar(value)
         if verify and not T.conforms(value, step.out_types[pin]):
+            declared = spec.output(pin)
+            origin = f" (a type taken from its {declared.source})" if (
+                declared is not None and declared.source in ("docstring", "annotation")) else ""
             mismatch = T.TypeMismatch(
-                f"output is declared {step.out_types[pin]} but the node returned "
+                f"output is declared {step.out_types[pin]}{origin} but the node returned "
                 f"{T.type_of(value)}")
             raise NodeError(step.node, spec.id, mismatch, pin, str(mismatch))
         values[(step.node, pin)] = value
