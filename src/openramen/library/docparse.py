@@ -117,7 +117,7 @@ def _join_wrapped_signature(lines: list[str]) -> list[str]:
     if not lines or not _SIGNATURE_START.match(lines[0]) or _SIGNATURE_LINE.match(lines[0]):
         return lines
     joined = lines[0].strip()
-    for count, line in enumerate(lines[1:8], start=2):
+    for count, line in enumerate(lines[1:40], start=2):   # one parameter per line happens
         if not line.strip():
             break
         joined += " " + line.strip()

@@ -256,11 +256,13 @@ def _is_ufunc_like(obj: Any) -> bool:
 
 
 def _ufunc_infer(obj: Any, value_pins: tuple[str, ...], out_pins: tuple[str, ...],
-                 untouched: Mapping[str, T.Type]) -> Callable[..., Mapping[str, T.Type]]:
+                 untouched: Mapping[str, Optional[T.Type]]
+                 ) -> Callable[..., Mapping[str, T.Type]]:
     """Exact output types of a ufunc, by sampling it.
 
     ``untouched`` gives, for the options that change the result type (``out``,
-    ``dtype``, ``signature``), the type they have when left alone.
+    ``dtype``, ``signature``, positional output buffers), the type they have
+    when left alone; ``None`` if their default is not known.
     """
     def infer(inputs: Mapping[str, Optional[T.Type]], config: Mapping[str, Any]
               ) -> Mapping[str, T.Type]:
@@ -373,13 +375,16 @@ def import_callable(obj: Any, id: Optional[str] = None, *,
             if not isinstance(plain, T.AnyT):
                 infer = _flag_infer(tuple(flags), outputs[0].name, plain)
         if _is_ufunc_like(obj) and override.outputs is None:
-            value_pins = tuple(p.name for p in inputs if p.kind == "positional")
+            # The operands are the required positional pins; older NumPy also
+            # documents optional positional output buffers after them.
+            value_pins = tuple(p.name for p in inputs if p.kind == "positional" and p.required)
             if len(value_pins) == obj.nin and len(outputs) != obj.nout:
                 outputs = _numbered_outputs(obj.nout)
             if len(value_pins) == obj.nin:
-                untouched = {p.name: T.type_of(p.default) for p in inputs
-                             if p.name in ("out", "dtype", "signature")
-                             and p.default is not MISSING and p.default is not DEFAULT}
+                untouched = {
+                    p.name: None if p.default is DEFAULT else T.type_of(p.default)
+                    for p in inputs if not p.required and not p.variadic and (
+                        p.kind == "positional" or p.name in ("out", "dtype", "signature"))}
                 infer = _ufunc_infer(obj, value_pins, tuple(p.name for p in outputs),
                                      untouched)
         if id is None:

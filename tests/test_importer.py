@@ -360,6 +360,25 @@ class TestUfuncs:
         assert str(analysis.out_type("n", "out")) == "Union[Array[float64, _], Float]"
         assert run(g, registry)["n"] == 1.0           # a 0-d array: NumPy returns a scalar
 
+    def test_optional_positional_buffers_do_not_count_as_operands(self):
+        """Older NumPy documents ``divmod(x1, x2[, out1, out2], /, ...)``."""
+        for text in ("divmod(x1, x2, out1=None, out2=None, /, *, where=True, dtype=None)",
+                     "divmod(x1, x2[, out1, out2], / [, out=(None, None)], *, where=True)"):
+            spec = import_callable(np.divmod, "t.divmod",
+                                   override=Override.from_mapping({"signature": text}))
+            operands = [p.name for p in spec.inputs if p.kind == "positional" and p.required]
+            assert operands == ["x1", "x2"], text
+            assert [p.name for p in spec.outputs] == ["out1", "out2"]
+            g = Graph()
+            g.add_node(spec, "n", values={"x1": 7, "x2": 2})
+            registry = default_registry()
+            registry.register(spec)
+            analysis = analyze(g, registry)
+            assert [str(t) for t in analysis.nodes["n"].out_types.values()] == ["Int", "Int"], text
+            assert run(g, registry)["n"] == {"out1": 3, "out2": 1}
+            # a wired output buffer makes sampling meaningless: fall back
+            assert spec.infer({"x1": T.INT, "x2": T.INT, "out1": T.ArrayT()}, {}) == {}
+
     def test_options_that_change_the_result_type_disable_sampling(self):
         registry = default_registry()
         registry.import_module("numpy")
