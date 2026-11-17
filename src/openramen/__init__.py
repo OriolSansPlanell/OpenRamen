@@ -18,17 +18,17 @@ from .library import (
     UnknownSpecError, default_registry, import_callable, import_module, pin_outputs,
     spec_from_function,
 )
-from .model import CycleError, Graph, GraphError, Node, Wire
-from .runtime import Event, NodeError, Plan, RunResult, compile_graph, run
+from .model import CycleError, Graph, GraphError, Node, Structure, Tunnel, Wire
+from .runtime import Cancelled, Event, NodeError, Plan, RunResult, compile_graph, run
 
 __version__ = "0.1.0.dev0"
 
 __all__ = [
-    "types", "Graph", "Node", "Wire", "GraphError", "CycleError",
+    "types", "Graph", "Node", "Wire", "Structure", "Tunnel", "GraphError", "CycleError",
     "NodeSpec", "PinSpec", "Registry", "MISSING", "SpecError", "UnknownSpecError",
     "default_registry", "spec_from_function", "DEFAULT", "ImportFailure",
     "import_callable", "import_module", "pin_outputs",
     "analyze", "Analysis", "Problem", "GraphCheckError", "registry_for",
-    "run", "compile_graph", "Plan", "RunResult", "Event", "NodeError",
+    "run", "compile_graph", "Plan", "RunResult", "Event", "NodeError", "Cancelled",
     "__version__",
 ]

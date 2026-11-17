@@ -44,7 +44,8 @@ def _run(args: argparse.Namespace) -> int:
             print(problem, file=sys.stderr)
         return 1
     try:
-        result = run(graph, targets=args.node or None)
+        result = run(graph, targets=args.node or None,
+                     detect_mutation=args.detect_mutation)
     except KeyError as exc:
         print(f"error: {exc.args[0]}", file=sys.stderr)
         return 2
@@ -99,6 +100,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_run.add_argument("file")
     p_run.add_argument("--node", action="append", metavar="ID",
                        help="only run and print this node (repeatable)")
+    p_run.add_argument("--detect-mutation", action="store_true",
+                       help="fail if a node changes a list or dict it did not declare it writes")
     p_run.set_defaults(func=_run)
     p_nodes = sub.add_parser("nodes", help="list the base palette")
     p_nodes.set_defaults(func=_nodes)

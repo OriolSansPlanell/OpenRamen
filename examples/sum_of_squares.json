@@ -1,0 +1,43 @@
+{
+  "format": "openramen.graph",
+  "version": 2,
+  "name": "sum of squares",
+  "nodes": [
+    {
+      "id": "loop",
+      "spec": "structure.for",
+      "values": {"total": 0},
+      "pos": [220.0, 0.0],
+      "structure": {
+        "kind": "for",
+        "inputs": [{"name": "x", "mode": "index"}],
+        "outputs": [{"name": "squares", "mode": "collect"}],
+        "registers": ["total"],
+        "frames": [
+          {
+            "nodes": [
+              {"id": "add", "spec": "base.add", "pos": [290.0, 80.0]},
+              {"id": "inputs", "spec": "frame.inputs", "pos": [0.0, 40.0]},
+              {"id": "outputs", "spec": "frame.outputs", "pos": [440.0, 40.0]},
+              {"id": "square", "spec": "base.multiply", "pos": [140.0, 0.0]}
+            ],
+            "wires": [
+              ["add", "out", "outputs", "total"],
+              ["inputs", "total", "add", "a"],
+              ["inputs", "x", "square", "a"],
+              ["inputs", "x", "square", "b"],
+              ["square", "out", "add", "b"],
+              ["square", "out", "outputs", "squares"]
+            ]
+          }
+        ]
+      }
+    },
+    {"id": "numbers", "spec": "base.constant", "config": {"value": [1, 2, 3, 4]}, "pos": [0.0, 60.0]},
+    {"id": "report", "spec": "base.format_value", "values": {"template": "total = {}"}, "pos": [760.0, 60.0]}
+  ],
+  "wires": [
+    ["loop", "total", "report", "value"],
+    ["numbers", "out", "loop", "x"]
+  ]
+}

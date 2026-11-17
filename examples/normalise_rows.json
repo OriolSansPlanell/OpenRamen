@@ -1,0 +1,38 @@
+{
+  "format": "openramen.graph",
+  "version": 2,
+  "name": "normalise rows",
+  "nodes": [
+    {"id": "image", "spec": "base.constant", "config": {"value": {"$ndarray": {"dtype": "float64", "shape": [3, 4], "data": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]}}}, "pos": [0.0, 60.0]},
+    {
+      "id": "rows",
+      "spec": "structure.for",
+      "pos": [220.0, 0.0],
+      "structure": {
+        "kind": "for",
+        "inputs": [{"name": "row", "mode": "index"}],
+        "outputs": [{"name": "normalised", "mode": "stack"}, {"name": "peaks", "mode": "stack"}],
+        "frames": [
+          {
+            "nodes": [
+              {"id": "inputs", "spec": "frame.inputs", "pos": [0.0, 40.0]},
+              {"id": "outputs", "spec": "frame.outputs", "pos": [440.0, 40.0]},
+              {"id": "peak", "spec": "base.array_max", "pos": [140.0, 80.0]},
+              {"id": "scale", "spec": "base.divide", "pos": [290.0, 0.0]}
+            ],
+            "wires": [
+              ["inputs", "row", "peak", "array"],
+              ["inputs", "row", "scale", "a"],
+              ["peak", "out", "outputs", "peaks"],
+              ["peak", "out", "scale", "b"],
+              ["scale", "out", "outputs", "normalised"]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "wires": [
+    ["image", "out", "rows", "row"]
+  ]
+}

@@ -338,7 +338,7 @@ class TestJson:
     def test_file_is_strict_json_with_one_item_per_line(self):
         text = diamond().dumps()
         data = json.loads(text)
-        assert data["format"] == FORMAT and data["version"] == VERSION
+        assert data["format"] == FORMAT and data["version"] == 1 and VERSION == 2
         assert [n["id"] for n in data["nodes"]] == ["join", "left", "right", "src"]
         assert text.endswith("}\n")
         lines = text.splitlines()

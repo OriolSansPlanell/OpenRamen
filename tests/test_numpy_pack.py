@@ -103,8 +103,9 @@ class TestPackContents:
             assert PACKED.get(f"numpy.{name}").outputs[0].aliases == source, name
         for name, pin in [("fill_diagonal", "a"), ("put", "a"), ("copyto", "dst")]:
             spec = PACKED.get(f"numpy.{name}")
-            assert spec.input(pin).access == "mutate" and not spec.pure, name
-            assert spec.outputs == ()
+            assert spec.input(pin).access == "mutate", name
+            # they return nothing: the written array is handed on instead
+            assert [(p.name, p.aliases, p.passthrough) for p in spec.outputs] == [(pin, pin, True)]
         assert PACKED.get("numpy.add").input("out").access == "mutate"   # found by the importer
 
     def test_utilities_are_left_out(self):

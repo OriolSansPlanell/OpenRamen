@@ -58,7 +58,7 @@ class ImportFailure(Exception):
 _OVERRIDE_KEYS = {
     "types", "outputs", "config", "hidden", "shown", "mutates", "aliases", "skip",
     "category", "pure", "thread_safe", "executor", "summary", "function", "presets",
-    "signature",
+    "signature", "passthrough",
 }
 _FIELD_KEYS = ("category", "pure", "thread_safe", "executor", "summary")
 
@@ -84,6 +84,8 @@ class Override:
     #: The signature to use, as text: ``"arange(start, stop=None, step=1)"``.
     #: For functions whose own signature cannot be read or cannot be wired.
     signature: str = ""
+    #: Mutated inputs that also become outputs of the same name.
+    passthrough: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any], where: str = "override") -> "Override":
@@ -139,7 +141,7 @@ class Override:
             raise SpecError(f"{where}: 'signature' must look like \"name(a, b=1)\"")
         return cls(types, outputs, names("config"), names("hidden"), names("shown"),
                    names("mutates"), table("aliases"), bool(data.get("skip", False)), fields,
-                   function, dict(presets), signature)
+                   function, dict(presets), signature, names("passthrough"))
 
 
 def load_overrides(source: "str | Path | Mapping[str, Any]") -> dict[str, Override]:
@@ -307,6 +309,7 @@ def import_callable(obj: Any, id: Optional[str] = None, *,
 
     for key, names in (("config", override.config), ("hidden", override.hidden),
                        ("shown", override.shown), ("mutates", override.mutates),
+                       ("passthrough", override.passthrough),
                        ("presets", tuple(override.presets))):
         for name in names:
             if name not in parameters:
@@ -362,13 +365,22 @@ def import_callable(obj: Any, id: Optional[str] = None, *,
                 hidden = True
             if name in override.shown:
                 hidden = False
-            mutate = name in override.mutates or name == "out" or (
+            mutate = name in override.mutates or name in override.passthrough \
+                or name == "out" or (
                 in_place and first_data_input and not variadic)
             first_data_input = False
             inputs.append(PinSpec(name, pin_type, default, text,
                                   access="mutate" if mutate else "read",
                                   kind=kind, hidden=hidden, source=source))
         outputs = _outputs(hints, doc, override, {p.name for p in inputs}, bool(flags))
+        by_name = {p.name: p for p in inputs}
+        for name in override.passthrough:
+            if name not in by_name or by_name[name].variadic:
+                raise ImportFailure(f"override passthrough: {name!r} is not an input pin")
+            if any(p.name == name for p in outputs):
+                raise ImportFailure(f"override passthrough: an output {name!r} already exists")
+            outputs.append(PinSpec(name, by_name[name].type, doc=by_name[name].doc,
+                                   aliases=name, passthrough=True, source="override"))
         infer = None
         if flags and override.outputs is None and len(outputs) == 1:
             plain = _first_result_type(hints, doc)

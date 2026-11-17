@@ -35,3 +35,12 @@ def out_type(spec_id: str, registry: Optional[Registry] = None, pin: str = "out"
     analysis = analyze(graph, registry)
     assert analysis.ok, analysis.problems
     return str(analysis.out_type("n", pin))
+
+
+def links(graph: Graph, *wires: str) -> None:
+    """Connect pins written as ``"source.pin > destination.pin"``."""
+    for text in wires:
+        source, destination = (part.strip() for part in text.split(">"))
+        src, src_pin = source.rsplit(".", 1)
+        dst, dst_pin = destination.rsplit(".", 1)
+        graph.connect(src, src_pin, dst, dst_pin)

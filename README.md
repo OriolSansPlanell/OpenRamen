@@ -8,16 +8,16 @@ The name is a reminder of what the code looks like if nobody keeps it tidy.
 
 ## Status
 
-Early. The **headless core** and the **importer** work and are tested; there
-is no editor yet.
+Early. The **headless core**, the **importer** and **structures** (loops,
+cases, subgraphs) work and are tested; there is no editor yet.
 
 | Milestone | State |
 | --- | --- |
 | 0. Specification | Done: [docs/spec.md](docs/spec.md) |
 | 1. Headless core: types, graph model, base palette, checker, runtime | Done |
 | 2. Importer: turn any Python function into a node | Done: [coverage](docs/coverage.md) |
-| 3. Structures (For, While, Case, subgraphs) and copy-on-branch rules | Next |
-| 4. Scheduler: thread and process pools, caching, cancel | Planned |
+| 3. Structures (For, While, Case, subgraphs) and copy-on-branch rules | Done |
+| 4. Scheduler: thread and process pools, caching, cancel | Next |
 | 5. Editor and front panel (Qt) | Planned |
 
 ## Try it
@@ -31,6 +31,7 @@ python -m openramen check examples/array_statistics.json
 python -m openramen nodes
 python -m openramen run examples/numpy_histogram.json   # nodes imported from NumPy
 python -m openramen import scipy.ndimage                # what importing a module gives
+python -m openramen run examples/collatz.json           # a While loop with a Case inside
 ```
 
 Building a graph in code:
@@ -75,6 +76,39 @@ g.connect("spectrum", "out", "magnitude", "x")
 print(ramen.run(g)["magnitude"].shape)      # (33,)
 ```
 
+Loops and cases are structures: nodes that hold a diagram of their own.
+Values cross their border through tunnels and shift registers, as in LabVIEW:
+
+```python
+g = ramen.Graph("sum of squares")
+g.add_node("base.constant", "numbers", config={"value": [1, 2, 3, 4]})
+
+loop = g.add_for("loop")
+loop.add_input("x", mode="index")           # one element per iteration
+loop.add_register("total")                  # carried from one iteration to the next
+loop.add_output("squares", mode="collect")  # one value per iteration, as a list
+loop.values["total"] = 0
+
+body = loop.frame
+body.add_node("base.multiply", "square")
+body.add_node("base.add", "add")
+body.connect("inputs", "x", "square", "a")
+body.connect("inputs", "x", "square", "b")
+body.connect("inputs", "total", "add", "a")
+body.connect("square", "out", "add", "b")
+body.connect("add", "out", "outputs", "total")
+body.connect("square", "out", "outputs", "squares")
+g.connect("numbers", "out", loop, "x")
+
+print(ramen.run(g)["loop"])                 # {'squares': [1, 4, 9, 16], 'total': 30}
+print(ramen.analyze(g).out_type("loop", "squares"))   # List[Int]
+```
+
+Wires carry values, not references. A node that writes to its input gets a
+private copy, every other node gets a read-only view, so a branch can never
+be changed behind your back, and nothing is copied that does not need to be.
+`run(g, detect_mutation=True)` catches nodes that are wrong about what they write.
+
 Pins, types and help come from each function's signature and docstring. Of
 166 real NumPy calls used as a benchmark, 165 run correctly from that alone;
 a small bundled override file fixes the rest. See [docs/coverage.md](docs/coverage.md).
@@ -93,7 +127,7 @@ src/openramen/
 docs/spec.md    the contracts everything builds on
 examples/       hand-written graphs, run by the test suite
 tests/          the test suite
-benchmarks/     per-node overhead and importer coverage measurements
+benchmarks/     per-node and per-iteration overhead, importer coverage
 ```
 
 ## Licence
@@ -109,4 +143,6 @@ pytest
 
 No milestone is considered done until its tests pass. The suite includes
 property-style tests that compare the static type checker against what
-actually happens at run time on thousands of random cases.
+actually happens at run time on thousands of random cases. Loops and cases are
+tested the same way: hundreds of random programs are run both as graphs and
+as plain Python, and must agree on every value.

@@ -132,35 +132,32 @@ aliases = { out = "val" }
 aliases = { out = "val" }
 
 # ---- functions that write into an argument --------------------------------
+# They return nothing.  The written array is passed on as an output of the
+# same name; OpenRamen hands the function a private copy, so on the diagram
+# these behave like ordinary functions that return a new array.
 
 [fill_diagonal]
-mutates = ["a"]
-pure = false
+passthrough = ["a"]
 outputs = []
 
 [put]
-mutates = ["a"]
-pure = false
+passthrough = ["a"]
 outputs = []
 
 [place]
-mutates = ["arr"]
-pure = false
+passthrough = ["arr"]
 outputs = []
 
 [putmask]
-mutates = ["a"]
-pure = false
+passthrough = ["a"]
 outputs = []
 
 [copyto]
-mutates = ["dst"]
-pure = false
+passthrough = ["dst"]
 outputs = []
 
 [put_along_axis]
-mutates = ["arr"]
-pure = false
+passthrough = ["arr"]
 outputs = []
 
 # ---- not data nodes --------------------------------------------------------

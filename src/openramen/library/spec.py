@@ -111,6 +111,10 @@ class PinSpec:
     kind: str = "keyword"            # how the argument is passed to the function
     hidden: bool = False             # optional input not shown until asked for
     source: str = ""                 # where the type came from: annotation, docstring, ...
+    #: Outputs: this pin hands on the object given to the input named in
+    #: ``aliases``, as it is after the call.  It is how a function that works
+    #: in place and returns nothing still has something to wire onwards.
+    passthrough: bool = False
 
     def __post_init__(self) -> None:
         if not _valid_name(self.name):
@@ -175,6 +179,9 @@ class NodeSpec:
             if pin.aliases is not None and pin.aliases not in {p.name for p in self.inputs}:
                 raise SpecError(
                     f"{self.id}: output {pin.name!r} aliases unknown input {pin.aliases!r}")
+            if pin.passthrough and pin.aliases is None:
+                raise SpecError(
+                    f"{self.id}: pass-through output {pin.name!r} must name its input")
         previous = self.inputs[0] if self.inputs else None
         for pin in self.inputs[1:]:
             assert previous is not None
@@ -327,27 +334,32 @@ class NodeSpec:
         for pin in self.config:
             if config is not None and pin.name in config:
                 kwargs[pin.name] = config[pin.name]
-        return self.spread(fn(*args, **kwargs))
+        results = self.spread(fn(*args, **kwargs))
+        for pin in self.outputs:
+            if pin.passthrough:
+                results[pin.name] = inputs.get(pin.aliases)  # type: ignore[arg-type]
+        return results
 
     def spread(self, result: Any) -> dict[str, Any]:
         """Distribute a function's return value over the output pins."""
-        count = len(self.outputs)
+        outputs = [p for p in self.outputs if not p.passthrough]
+        count = len(outputs)
         if count == 0:
             return {}
         if count == 1:
-            return {self.outputs[0].name: result}
+            return {outputs[0].name: result}
         if isinstance(result, Mapping):
-            names = {p.name for p in self.outputs}
+            names = {p.name for p in outputs}
             if set(result) != names:
                 raise NodeResultError(
                     f"{self.id}: returned keys {sorted(map(str, result))}, "
                     f"expected {sorted(names)}")
-            return {p.name: result[p.name] for p in self.outputs}
+            return {p.name: result[p.name] for p in outputs}
         if isinstance(result, Sequence) and not isinstance(result, (str, bytes)):
             if len(result) != count:
                 raise NodeResultError(
                     f"{self.id}: returned {len(result)} values for {count} outputs")
-            return {p.name: v for p, v in zip(self.outputs, result)}
+            return {p.name: v for p, v in zip(outputs, result)}
         raise NodeResultError(
             f"{self.id}: returned {type(result).__name__} for {count} outputs; "
             "expected a tuple")
@@ -401,6 +413,7 @@ def spec_from_function(
     types: Optional[Mapping[str, Any]] = None,
     config: Sequence[str] = (),
     mutates: Sequence[str] = (),
+    passthrough: Sequence[str] = (),
     docs: Optional[Mapping[str, str]] = None,
     **fields: Any,
 ) -> NodeSpec:
@@ -412,6 +425,8 @@ def spec_from_function(
     * ``types`` overrides the type of any pin, by name.
     * ``config`` lists parameters that are configuration, not wirable inputs.
     * ``mutates`` lists inputs the function writes to in place.
+    * ``passthrough`` lists mutated inputs that also become outputs of the same
+      name, so the modified object can be wired onwards.
     * Remaining keyword arguments are NodeSpec fields (``category``, ...).
     """
     if not callable(fn):
@@ -433,6 +448,7 @@ def spec_from_function(
             return T.type_of(default)
         return T.ANY
 
+    mutates = tuple(mutates) + tuple(n for n in passthrough if n not in mutates)
     unknown = (set(config) | set(mutates)) - set(signature.parameters)
     if unknown:
         raise SpecError(f"{fn!r} has no parameter named {sorted(unknown)[0]!r}")
@@ -482,6 +498,14 @@ def spec_from_function(
                 doc=docs.get(name, ""))
         for name, etype in zip(outputs, element_types))
 
+    if passthrough:
+        if outputs == ("out",) and returns is inspect.Signature.empty:
+            output_pins = ()     # an in-place function: nothing but the pass-throughs
+        by_name = {p.name: p for p in inputs}
+        for name in passthrough:
+            if name not in by_name:
+                raise SpecError(f"pass-through {name!r} is not an input")
+            output_pins += (PinSpec(name, by_name[name].type, aliases=name, passthrough=True),)
     if id is None:
         module = getattr(fn, "__module__", None) or "user"
         id = f"{module}.{getattr(fn, '__name__', 'node')}"

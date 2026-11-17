@@ -23,14 +23,57 @@ def test_example_is_valid(path):
     graph = Graph.load(path)
     analysis = analyze(graph)
     assert analysis.problems == []
-    result = run(graph, check_outputs=True)
+    result = run(graph, check_outputs=True, detect_mutation=True)
     assert set(result.durations) == {n.id for n in graph}
     # every example is stored exactly as OpenRamen itself would write it
     assert graph.dumps() == path.read_text(encoding="utf-8")
     # and only uses the base palette plus the modules it declares
     registry = ramen.registry_for(graph)
-    assert all(node.spec in registry for node in graph)
+
+    def plain_nodes(diagram):
+        for node in diagram:
+            if isinstance(node, ramen.Structure):
+                for frame in node.frames:
+                    yield from plain_nodes(frame)
+            elif node.id not in ("inputs", "outputs") or diagram is graph:
+                yield node
+
+    assert all(node.spec in registry for node in plain_nodes(graph))
     assert set(graph.imports) <= {"numpy"}
+
+
+def test_sum_of_squares():
+    graph = Graph.load(EXAMPLES / "sum_of_squares.json")
+    numbers = graph.node("numbers").config["value"]
+    result = run(graph)
+    assert result["loop"] == {"squares": [n * n for n in numbers],
+                              "total": sum(n * n for n in numbers)}
+    assert result["report"] == f"total = {sum(n * n for n in numbers)}"
+
+
+@pytest.mark.parametrize("start", [1, 6, 27, 97, 871])
+def test_collatz(start):
+    graph = Graph.load(EXAMPLES / "collatz.json")
+    graph.node("start").config["value"] = start
+    n, steps, peak = start, 0, 0
+    while True:
+        n = n // 2 if n % 2 == 0 else 3 * n + 1
+        steps, peak = steps + 1, max(peak, n)
+        if n <= 1:
+            break
+    assert run(graph, check_outputs=True)["loop"] == {"steps": steps, "n": n, "peak": peak}
+
+
+def test_normalise_rows():
+    import numpy as np
+    graph = Graph.load(EXAMPLES / "normalise_rows.json")
+    image = graph.node("image").config["value"]
+    result = run(graph, check_outputs=True)["rows"]
+    assert np.array_equal(result["normalised"], image / image.max(axis=1, keepdims=True))
+    assert np.array_equal(result["peaks"], image.max(axis=1))
+    analysis = analyze(graph)
+    assert str(analysis.out_type("rows", "normalised")) == "Array[float64, 2]"
+    assert str(analysis.out_type("rows", "peaks")) == "Array[float64, 1]"
 
 
 def test_arithmetic():
@@ -90,6 +133,24 @@ class TestCommandLine:
     def test_run_prints_the_ends_of_the_diagram(self, capsys):
         assert main(["run", str(EXAMPLES / "arithmetic.json")]) == 0
         assert capsys.readouterr().out == "text.out = 'result = 10.0'\n"
+
+    def test_run_a_graph_with_structures(self, capsys):
+        path = str(EXAMPLES / "collatz.json")
+        assert main(["check", path]) == 0
+        assert "ok (2 nodes, 1 wires)" in capsys.readouterr().out
+        assert main(["run", path, "--detect-mutation"]) == 0
+        assert capsys.readouterr().out == "loop.steps = 111\nloop.n = 1\nloop.peak = 9232\n"
+
+    def test_errors_inside_structures_are_reported(self, tmp_path, capsys):
+        graph = Graph.load(EXAMPLES / "collatz.json")
+        graph.node("loop").max_iterations = 5
+        graph.save(tmp_path / "short.json")
+        assert main(["run", str(tmp_path / "short.json")]) == 1
+        assert "did not stop within 5 iterations" in capsys.readouterr().err
+        graph.node("loop").frame.remove_node("done")
+        graph.save(tmp_path / "broken.json")
+        assert main(["check", str(tmp_path / "broken.json")]) == 1
+        assert "[loop.stop]" in capsys.readouterr().out
 
     def test_run_selected_nodes(self, capsys):
         path = str(EXAMPLES / "arithmetic.json")

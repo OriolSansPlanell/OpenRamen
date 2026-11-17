@@ -1,0 +1,86 @@
+{
+  "format": "openramen.graph",
+  "version": 2,
+  "name": "collatz",
+  "nodes": [
+    {
+      "id": "loop",
+      "spec": "structure.while",
+      "values": {"peak": 0},
+      "pos": [200.0, 0.0],
+      "structure": {
+        "kind": "while",
+        "inputs": [],
+        "outputs": [{"name": "steps", "mode": "last"}],
+        "registers": ["n", "peak"],
+        "max_iterations": 10000,
+        "frames": [
+          {
+            "nodes": [
+              {"id": "count", "spec": "base.add", "values": {"b": 1}, "pos": [520.0, 240.0]},
+              {"id": "done", "spec": "base.less_equal", "values": {"b": 1}, "pos": [520.0, 80.0]},
+              {"id": "higher", "spec": "base.maximum", "pos": [520.0, 160.0]},
+              {"id": "inputs", "spec": "frame.inputs", "pos": [0.0, 80.0]},
+              {"id": "outputs", "spec": "frame.outputs", "pos": [820.0, 80.0]},
+              {"id": "parity", "spec": "base.remainder", "values": {"b": 2}, "pos": [140.0, 0.0]},
+              {
+                "id": "step",
+                "spec": "structure.case",
+                "pos": [300.0, 0.0],
+                "structure": {
+                  "kind": "case",
+                  "inputs": [{"name": "n", "mode": "plain"}],
+                  "outputs": [{"name": "next", "mode": "last"}],
+                  "cases": [[0], null],
+                  "frames": [
+                    {
+                      "nodes": [
+                        {"id": "half", "spec": "base.floor_divide", "values": {"b": 2}, "pos": [140.0, 0.0]},
+                        {"id": "inputs", "spec": "frame.inputs"},
+                        {"id": "outputs", "spec": "frame.outputs"}
+                      ],
+                      "wires": [
+                        ["half", "out", "outputs", "next"],
+                        ["inputs", "n", "half", "a"]
+                      ]
+                    },
+                    {
+                      "nodes": [
+                        {"id": "inputs", "spec": "frame.inputs"},
+                        {"id": "outputs", "spec": "frame.outputs"},
+                        {"id": "plus_one", "spec": "base.add", "values": {"b": 1}, "pos": [280.0, 0.0]},
+                        {"id": "triple", "spec": "base.multiply", "values": {"b": 3}, "pos": [140.0, 0.0]}
+                      ],
+                      "wires": [
+                        ["inputs", "n", "triple", "a"],
+                        ["plus_one", "out", "outputs", "next"],
+                        ["triple", "out", "plus_one", "a"]
+                      ]
+                    }
+                  ]
+                }
+              }
+            ],
+            "wires": [
+              ["count", "out", "outputs", "steps"],
+              ["done", "out", "outputs", "stop"],
+              ["higher", "out", "outputs", "peak"],
+              ["inputs", "i", "count", "a"],
+              ["inputs", "n", "parity", "a"],
+              ["inputs", "n", "step", "n"],
+              ["inputs", "peak", "higher", "a"],
+              ["parity", "out", "step", "selector"],
+              ["step", "next", "done", "a"],
+              ["step", "next", "higher", "b"],
+              ["step", "next", "outputs", "n"]
+            ]
+          }
+        ]
+      }
+    },
+    {"id": "start", "spec": "base.constant", "config": {"value": 27}, "pos": [0.0, 60.0]}
+  ],
+  "wires": [
+    ["start", "out", "loop", "n"]
+  ]
+}
