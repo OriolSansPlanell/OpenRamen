@@ -1,0 +1,22 @@
+{
+  "format": "openramen.graph",
+  "version": 1,
+  "name": "arithmetic: (a + b) * c",
+  "nodes": [
+    {"id": "a", "spec": "base.constant", "config": {"value": 2}},
+    {"id": "b", "spec": "base.constant", "config": {"value": 0.5}, "pos": [0.0, 80.0]},
+    {"id": "c", "spec": "base.constant", "config": {"value": 4}, "pos": [0.0, 160.0]},
+    {"id": "product", "spec": "base.multiply", "pos": [320.0, 80.0]},
+    {"id": "rounded", "spec": "base.round", "values": {"digits": 1}, "pos": [480.0, 80.0]},
+    {"id": "sum", "spec": "base.add", "pos": [160.0, 40.0]},
+    {"id": "text", "spec": "base.format_value", "values": {"template": "result = {}"}, "pos": [640.0, 80.0]}
+  ],
+  "wires": [
+    ["a", "out", "sum", "a"],
+    ["b", "out", "sum", "b"],
+    ["c", "out", "product", "b"],
+    ["product", "out", "rounded", "x"],
+    ["rounded", "out", "text", "value"],
+    ["sum", "out", "product", "a"]
+  ]
+}

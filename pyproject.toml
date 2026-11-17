@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openramen"
+version = "0.1.0.dev0"
+description = "A LabVIEW-style visual dataflow framework on top of Python"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=2.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+openramen = "openramen.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+filterwarnings = ["ignore::RuntimeWarning"]
+
+[tool.mypy]
+ignore_missing_imports = true
+disable_error_code = ["misc"]

@@ -1,0 +1,25 @@
+{
+  "format": "openramen.graph",
+  "version": 1,
+  "name": "generic nodes: lists and select",
+  "nodes": [
+    {"id": "count", "spec": "base.list_length"},
+    {"id": "first", "spec": "base.list_get", "values": {"index": 0}},
+    {"id": "is_long", "spec": "base.greater", "values": {"b": 3}},
+    {"id": "label", "spec": "base.select", "values": {"if_false": "short", "if_true": "long"}},
+    {"id": "numbers", "spec": "base.range_list", "values": {"start": 1, "stop": 6}},
+    {"id": "picked", "spec": "base.select", "values": {"if_false": 0.5}},
+    {"id": "reversed", "spec": "base.list_reverse"},
+    {"id": "with_extra", "spec": "base.list_append", "values": {"item": 2.5}}
+  ],
+  "wires": [
+    ["count", "out", "is_long", "a"],
+    ["first", "out", "picked", "if_true"],
+    ["is_long", "out", "label", "condition"],
+    ["is_long", "out", "picked", "condition"],
+    ["numbers", "out", "count", "items"],
+    ["numbers", "out", "reversed", "items"],
+    ["numbers", "out", "with_extra", "items"],
+    ["reversed", "out", "first", "items"]
+  ]
+}

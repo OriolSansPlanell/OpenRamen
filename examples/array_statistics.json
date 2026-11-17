@@ -1,0 +1,29 @@
+{
+  "format": "openramen.graph",
+  "version": 1,
+  "name": "arrays: a sampled sine wave and its statistics",
+  "nodes": [
+    {"id": "amplitude", "spec": "base.constant", "config": {"value": 3}},
+    {"id": "as_bytes", "spec": "base.constant", "config": {"value": {"$ndarray": {"dtype": "uint8", "shape": [2, 3], "data": [1, 2, 3, 4, 5, 6]}}}},
+    {"id": "bytes_total", "spec": "base.array_sum"},
+    {"id": "first_row", "spec": "base.array_get", "values": {"index": 0}},
+    {"id": "mean", "spec": "base.array_mean"},
+    {"id": "peak", "spec": "base.array_max"},
+    {"id": "positive", "spec": "base.greater", "values": {"b": 0.0}},
+    {"id": "scaled", "spec": "base.multiply"},
+    {"id": "shape", "spec": "base.array_shape"},
+    {"id": "wave", "spec": "base.sin"},
+    {"id": "x", "spec": "base.linspace", "values": {"count": 9, "start": 0.0, "stop": 6.283185307179586}}
+  ],
+  "wires": [
+    ["amplitude", "out", "scaled", "b"],
+    ["as_bytes", "out", "bytes_total", "array"],
+    ["as_bytes", "out", "first_row", "array"],
+    ["as_bytes", "out", "shape", "array"],
+    ["scaled", "out", "mean", "array"],
+    ["scaled", "out", "peak", "array"],
+    ["scaled", "out", "positive", "a"],
+    ["wave", "out", "scaled", "a"],
+    ["x", "out", "wave", "x"]
+  ]
+}
