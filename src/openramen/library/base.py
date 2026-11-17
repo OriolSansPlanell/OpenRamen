@@ -50,7 +50,8 @@ def _add(fn: Callable[..., Any], name: str, category: str, **options: Any) -> No
 # Type inference by sampling
 # --------------------------------------------------------------------------
 
-_SAMPLES: dict[T.Type, Any] = {INT: 1, FLOAT: 1.0, COMPLEX: 1j, BOOL: True, STR: "a"}
+# Sample values avoid 0, 1, 2 and 0.5, which some operations treat specially.
+_SAMPLES: dict[T.Type, Any] = {INT: 3, FLOAT: 3.0, COMPLEX: 3j, BOOL: True, STR: "a"}
 
 
 def _sample(t: T.Type) -> Any:
@@ -65,7 +66,7 @@ def _sample(t: T.Type) -> Any:
         if dtype.kind not in "biufc":
             return None
         ndim = t.ndim if isinstance(t.ndim, int) else 1
-        return np.ones((1,) * ndim, dtype=dtype)
+        return np.full((1,) * ndim, 3, dtype=dtype)
     return None
 
 
@@ -180,7 +181,9 @@ def _power(a: Any, b: Any) -> Any:
     real result is NaN.
     """
     if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-        return operator.pow(a, b)
+        # The ufunc, not ``**``: the operator has shortcuts for exponents such
+        # as 1, 2 and 0.5 that, in some NumPy versions, change the result dtype.
+        return np.power(a, b)
     if isinstance(a, int) and isinstance(b, int):
         if b < 0:
             raise ValueError(

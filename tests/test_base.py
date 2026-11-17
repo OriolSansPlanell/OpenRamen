@@ -298,3 +298,13 @@ def test_array_from_an_empty_list_matches_its_static_type():
             config = {} if dtype is None else {"dtype": dtype}
             out = call("base.array_from_list", items=items, config=config)   # outputs checked
             assert dtype is None or out.dtype == np.dtype(dtype)
+
+
+def test_array_power_dtype_does_not_depend_on_the_exponent_value():
+    """``**`` has shortcuts for exponents like 1, 2 and 0.5; the node must not."""
+    base_array = np.array([[1.5, 2.5]], dtype="float32")
+    for exponent in (0.5, 1.0, 2.0, 4.0, -1.0):
+        zero_d = call("base.power", a=base_array, b=np.array(exponent))
+        assert zero_d.dtype == np.float64, exponent          # float32 with a float64 array
+        weak = call("base.power", a=base_array, b=exponent)
+        assert weak.dtype == np.float32, exponent            # a Python float adapts to the array
