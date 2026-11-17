@@ -202,23 +202,23 @@ def _namespace(obj: Any) -> dict[str, Any]:
 def get_signature(obj: Any, doc: Optional[Doc] = None) -> tuple[inspect.Signature, str]:
     """The signature of a callable and where it was found.
 
-    Tries ``inspect``, then the structure of a NumPy ufunc, then a signature
-    line at the top of the docstring.
+    Tries ``inspect``, then a signature line at the top of the docstring, then
+    the structure of a NumPy ufunc.
     """
     try:
         return inspect.signature(obj), "inspect"
     except (TypeError, ValueError):
         pass
-    if isinstance(obj, np.ufunc):
-        names = ["x"] if obj.nin == 1 else [f"x{i + 1}" for i in range(obj.nin)]
-        params = [inspect.Parameter(n, inspect.Parameter.POSITIONAL_ONLY) for n in names]
-        return inspect.Signature(params), "ufunc"
     if doc is None:
         doc = parse_docstring(getattr(obj, "__doc__", None))
     if doc.signature:
         signature = signature_from_text(doc.signature, _namespace(obj))
         if signature is not None:
             return signature, "docstring"
+    if isinstance(obj, np.ufunc):
+        names = ["x"] if obj.nin == 1 else [f"x{i + 1}" for i in range(obj.nin)]
+        params = [inspect.Parameter(n, inspect.Parameter.POSITIONAL_ONLY) for n in names]
+        return inspect.Signature(params), "ufunc"
     raise ImportFailure("no signature could be found")
 
 

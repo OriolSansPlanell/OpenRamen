@@ -194,8 +194,9 @@ does.
 
 For each function the importer needs a signature and types.
 
-**Signature**, first that works: `inspect.signature`; the structure of a
-NumPy ufunc; a `name(a, b=1)` line at the top of the docstring.
+**Signature**, first that works: `inspect.signature`; a `name(a, b=1)` line
+at the top of the docstring; the structure of a NumPy ufunc; a `signature`
+given in an override.
 
 **Type of an input**, first that gives one:
 

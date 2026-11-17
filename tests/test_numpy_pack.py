@@ -35,7 +35,12 @@ def test_raw_import_needs_almost_no_manual_fixes():
 def test_every_public_function_is_importable():
     for provider in PACKED.providers:
         summary = report(provider)
-        assert summary.failures == {}, summary.failures
+        details = []
+        for name, reason in sorted(summary.failures.items()):
+            doc = (getattr(getattr(provider.module, name, None), "__doc__", "") or "").strip()
+            details.append(f"{provider.prefix}.{name}: {reason} | doc starts: "
+                           + " / ".join(doc.splitlines()[:3]))
+        assert not details, "NumPy %s cannot import:\n%s" % (np.__version__, "\n".join(details))
         assert summary.imported + summary.skipped == summary.candidates
         assert summary.documented == summary.imported
         assert summary.typed_inputs / summary.inputs > 0.6

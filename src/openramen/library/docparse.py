@@ -75,7 +75,9 @@ def parse_docstring(text: Optional[str]) -> Doc:
 
 
 def _parse(lines: list[str], doc: Doc) -> None:
-    # Leading signature lines, as C functions have them.
+    # Leading signature lines, as C functions have them.  A long one may be
+    # wrapped over several lines.
+    lines = _join_wrapped_signature(lines)
     while lines and _SIGNATURE_LINE.match(lines[0]):
         if not doc.signature:
             doc.signature = lines[0].strip()
@@ -106,6 +108,24 @@ def _parse(lines: list[str], doc: Doc) -> None:
             doc.returns.extend(items)
     if intro_fields or any(_REST_FIELD.match(l.strip()) for l in lines):
         _rest_fields(lines, doc)
+
+
+_SIGNATURE_START = re.compile(r"^\s*[A-Za-z_][\w.]*\s*\(")
+
+
+def _join_wrapped_signature(lines: list[str]) -> list[str]:
+    if not lines or not _SIGNATURE_START.match(lines[0]) or _SIGNATURE_LINE.match(lines[0]):
+        return lines
+    joined = lines[0].strip()
+    for count, line in enumerate(lines[1:8], start=2):
+        if not line.strip():
+            break
+        joined += " " + line.strip()
+        if joined.count("(") == joined.count(")"):
+            if _SIGNATURE_LINE.match(joined):
+                return [joined] + lines[count:]
+            break
+    return lines
 
 
 def _paragraphs(lines: list[str]) -> list[list[str]]:

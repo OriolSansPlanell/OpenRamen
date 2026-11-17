@@ -121,6 +121,20 @@ class TestNumpydoc:
         two = parse_docstring("f(a)\nf(a, b)\n\nSummary.")
         assert two.signature == "f(a)" and two.summary == "Summary."
 
+    def test_signature_wrapped_over_several_lines(self):
+        doc = parse_docstring("array(object, dtype=None, *, copy=True, order='K',\n"
+                              "      subok=False, ndmin=0,\n      like=None)\n\nCreate an array.")
+        assert doc.signature == ("array(object, dtype=None, *, copy=True, order='K', "
+                                 "subok=False, ndmin=0, like=None)")
+        assert doc.summary == "Create an array."
+        sig = signature_from_text(doc.signature)
+        assert list(sig.parameters) == ["object", "dtype", "copy", "order", "subok", "ndmin", "like"]
+        # prose that merely starts like a call is left alone
+        prose = parse_docstring("f(x) is the function\nthat does (something\n\nMore.")
+        assert prose.signature == "" and prose.summary.startswith("f(x) is the function")
+        unbalanced = parse_docstring("f(a,\n\nSummary.")
+        assert unbalanced.signature == ""
+
 
 class TestGoogle:
     TEXT = '''Fetch rows from a table.
