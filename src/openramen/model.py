@@ -36,11 +36,13 @@ VERSION = 2
 INPUTS, OUTPUTS = "inputs", "outputs"
 FRAME_IN, FRAME_OUT = "frame.inputs", "frame.outputs"
 
-STRUCTURE_KINDS = ("for", "while", "case", "subgraph")
+STRUCTURE_KINDS = ("for", "while", "case", "subgraph", "try", "with")
 INPUT_MODES = ("plain", "index")
 OUTPUT_MODES = ("last", "collect", "stack", "concat")
 #: Pin names the structures use themselves.
 RESERVED_PINS = ("i", "count", "stop", "selector")
+#: Further pin names that only one kind of structure uses itself.
+KIND_PINS = {"try": ("error", "error_type", "failed"), "with": ("resource",)}
 
 _ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
@@ -129,11 +131,13 @@ class Tunnel:
 
 @dataclass
 class Structure(Node):
-    """A node that owns diagrams: a loop, a case structure or a subgraph.
+    """A node that owns diagrams: a loop, a case structure, a subgraph, a Try
+    or a With structure.
 
-    ``frames`` are the inner diagrams (one, or one per case).  Each frame has
-    an ``inputs`` node, whose outputs are what the frame receives, and an
-    ``outputs`` node, whose inputs are what it gives back.
+    ``frames`` are the inner diagrams: one, one per case, or for a Try the
+    body and its error handler.  Each frame has an ``inputs`` node, whose
+    outputs are what the frame receives, and an ``outputs`` node, whose
+    inputs are what it gives back.
     """
 
     kind: str = "subgraph"
@@ -150,6 +154,13 @@ class Structure(Node):
     cases: list[Optional[list]] = field(default_factory=list)
     #: While loops: fail instead of looping forever.  ``None`` means no limit.
     max_iterations: Optional[int] = None
+    #: For loops without shift registers: iterations may run at the same time.
+    parallel: bool = False
+
+    @property
+    def reserved(self) -> tuple[str, ...]:
+        """Pin names this structure uses itself."""
+        return RESERVED_PINS + KIND_PINS.get(self.kind, ())
 
     @property
     def frame(self) -> "Graph":
@@ -178,20 +189,25 @@ class Structure(Node):
             if len(self.cases) != len(self.frames):
                 found.append(f"{len(self.frames)} frames but {len(self.cases)} case entries")
         else:
-            if len(self.frames) != 1:
-                found.append(f"a {self.kind} structure has exactly one frame, "
-                             f"not {len(self.frames)}")
+            wanted = 2 if self.kind == "try" else 1
+            if len(self.frames) != wanted:
+                found.append(
+                    f"a {self.kind} structure has exactly "
+                    f"{'two frames' if wanted == 2 else 'one frame'}, not {len(self.frames)}")
             if self.cases:
                 found.append("only a case structure has cases")
         if self.registers and not loop:
             found.append("only loops have shift registers")
+        if self.parallel and (self.kind != "for" or self.registers):
+            found.append("only a For loop without shift registers can run its "
+                         "iterations in parallel")
         for side, tunnels, modes in (("input", self.inputs, INPUT_MODES),
                                      ("output", self.outputs, OUTPUT_MODES)):
             names = [t.name for t in tunnels] + list(self.registers)
             for name in sorted(set(names)):
                 if names.count(name) > 1:
                     found.append(f"more than one {side} pin is called {name!r}")
-                if name in RESERVED_PINS:
+                if name in self.reserved:
                     found.append(f"{name!r} is a pin the structure uses itself")
             for tunnel in tunnels:
                 if tunnel.mode not in modes:
@@ -210,7 +226,7 @@ class Structure(Node):
 
     def _check_new(self, name: str, taken: list[str]) -> None:
         _check_name("pin name", name)
-        if name in RESERVED_PINS:
+        if name in self.reserved:
             raise GraphError(f"{name!r} is a pin the structure uses itself")
         if name in taken:
             raise GraphError(f"structure {self.id!r} already has a pin {name!r}")
@@ -242,6 +258,9 @@ class Structure(Node):
         """Add a shift register (loops only)."""
         if self.kind not in ("for", "while"):
             raise GraphError("only loops have shift registers")
+        if self.parallel:
+            raise GraphError("a loop that runs its iterations in parallel cannot have "
+                             "shift registers")
         self._check_new(name, [t.name for t in self.inputs + self.outputs] + self.registers)
         self.registers.append(name)
         return name
@@ -395,7 +414,8 @@ class Graph:
     def add_structure(self, kind: str, id: Optional[str] = None, *,
                       cases: Optional[list] = None,
                       pos: Iterable[float] = (0.0, 0.0), label: str = "") -> Structure:
-        """Place a structure: ``"for"``, ``"while"``, ``"case"`` or ``"subgraph"``.
+        """Place a structure: ``"for"``, ``"while"``, ``"case"``, ``"subgraph"``,
+        ``"try"`` or ``"with"``.
 
         A case structure takes ``cases``, one entry per frame: a list of the
         values that frame handles, or ``None`` for the default frame.
@@ -413,6 +433,8 @@ class Graph:
                     structure.add_frame(match)
                 if not structure.frames:
                     raise GraphError("a case structure needs at least one frame")
+            elif kind == "try":
+                structure.frames += [_new_frame(f"{plain.id}[0]"), _new_frame(f"{plain.id}[1]")]
             else:
                 structure.frames.append(_new_frame(plain.id))
         except GraphError:
@@ -420,9 +442,16 @@ class Graph:
             raise
         return structure
 
-    def add_for(self, id: Optional[str] = None, **options: Any) -> Structure:
-        """A For loop: runs its frame ``count`` times, or once per indexed element."""
-        return self.add_structure("for", id, **options)
+    def add_for(self, id: Optional[str] = None, *, parallel: bool = False,
+                **options: Any) -> Structure:
+        """A For loop: runs its frame ``count`` times, or once per indexed element.
+
+        With ``parallel`` the iterations may run at the same time; such a loop
+        cannot have shift registers.
+        """
+        loop = self.add_structure("for", id, **options)
+        loop.parallel = bool(parallel)
+        return loop
 
     def add_while(self, id: Optional[str] = None, *, max_iterations: Optional[int] = None,
                   **options: Any) -> Structure:
@@ -438,6 +467,16 @@ class Graph:
     def add_subgraph(self, id: Optional[str] = None, **options: Any) -> Structure:
         """A diagram used as one node."""
         return self.add_structure("subgraph", id, **options)
+
+    def add_try(self, id: Optional[str] = None, **options: Any) -> Structure:
+        """A Try structure: frame 0 is the body, frame 1 runs if a node in the
+        body fails and receives the ``error`` message and its ``error_type``."""
+        return self.add_structure("try", id, **options)
+
+    def add_with(self, id: Optional[str] = None, **options: Any) -> Structure:
+        """A With structure: enters the context manager wired to ``resource``,
+        runs its frame, and always leaves the context manager again."""
+        return self.add_structure("with", id, **options)
 
     def remove_node(self, ref: NodeRef) -> None:
         """Remove a node and every wire attached to it."""
@@ -537,7 +576,7 @@ class Graph:
                     inputs=[copy.deepcopy(t) for t in node.inputs],
                     outputs=[copy.deepcopy(t) for t in node.outputs],
                     registers=list(node.registers), cases=copy.deepcopy(node.cases),
-                    max_iterations=node.max_iterations)
+                    max_iterations=node.max_iterations, parallel=node.parallel)
             else:
                 clone._nodes[node.id] = Node(*base)
         for wire in self._all_wires():
@@ -709,6 +748,8 @@ def _structure_to_dict(node: Structure) -> dict[str, Any]:
             for match in node.cases]
     if node.max_iterations is not None:
         item["max_iterations"] = node.max_iterations
+    if node.parallel:
+        item["parallel"] = True
     item["frames"] = [frame._body() for frame in node.frames]
     return item
 
@@ -725,10 +766,11 @@ def _structure_from_dict(node: Node, data: Any) -> Structure:
     frames = data.get("frames")
     if not isinstance(frames, list) or not frames or not all(isinstance(f, dict) for f in frames):
         raise GraphError(f"{where}: 'frames' must be a non-empty list")
-    if kind != "case" and len(frames) != 1:
-        raise GraphError(f"{where}: a {kind} structure has exactly one frame")
+    if kind != "case" and len(frames) != (2 if kind == "try" else 1):
+        raise GraphError(f"{where}: a {kind} structure has exactly "
+                         + ("two frames" if kind == "try" else "one frame"))
     for index, body in enumerate(frames):
-        frame = Graph(f"{node.id}[{index}]" if kind == "case" else node.id)
+        frame = Graph(f"{node.id}[{index}]" if kind in ("case", "try") else node.id)
         frame._load_body(body)
         structure.frames.append(frame)
     try:
@@ -765,6 +807,10 @@ def _structure_from_dict(node: Node, data: Any) -> Structure:
         if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
             raise GraphError("'max_iterations' must be a positive integer")
         structure.max_iterations = limit
+        if data.get("parallel"):
+            if kind != "for" or structure.registers:
+                raise GraphError("only a For loop without shift registers can be parallel")
+            structure.parallel = True
     except GraphError as exc:
         raise GraphError(f"{where}: {exc}") from exc
     return structure

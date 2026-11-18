@@ -280,7 +280,7 @@ class TestTargets:
 class TestEvents:
     def test_sequence(self):
         events = []
-        run(expression(), listener=events.append)
+        run(expression(), listener=events.append, workers=1)     # one at a time: in order
         kinds = [e.kind for e in events]
         assert kinds[0] == "graph-started" and kinds[-1] == "graph-finished"
         assert kinds.count("node-started") == kinds.count("node-finished") == 5

@@ -110,8 +110,8 @@ Arguments are passed by position for as long as no pin is left out, then by
 keyword. The type of a growable pin is the type of one element.
 
 `access`, `aliases` and `passthrough` drive the copy rules (section 4).
-`thread_safe`, `executor`, `widget` and `hidden` are recorded now and acted on
-by later milestones (scheduler, panel).
+`thread_safe`, `executor` and `pure` decide how a node is scheduled (section 4).
+`widget` and `hidden` are recorded now and acted on by the front panel.
 
 ## 3. Graph file
 
@@ -171,6 +171,8 @@ A structure is a node that holds diagrams of its own, called frames. Its
 | `for` | 1 | Once per element of its indexing inputs, or `count` times. The shortest wins when both are given; a count below 1 means no iterations |
 | `while` | 1 | Until its frame delivers `true` to `stop`. The test comes after the iteration, so the frame runs at least once. `max_iterations` (optional) turns a loop that never stops into an error |
 | `case` | 1 or more | Exactly one frame, chosen by `selector` |
+| `try` | 2 | Frame 0, the body. If a node in it fails, the rest of the body is skipped, its outputs are dropped, and frame 1, the handler, runs instead |
+| `with` | 1 | Once, between entering and leaving the context manager wired to `resource` |
 
 Every frame is a graph (`nodes`, `wires`) containing two boundary nodes that
 cannot be removed: `inputs` (spec `frame.inputs`) hands values to the frame,
@@ -190,13 +192,27 @@ structure is an ordinary node with these pins:
 | `i` (loops) | | `inputs.i`: the iteration number, from 0 |
 | `stop` (While) | | `outputs.stop`: a Bool |
 | `selector` (Case) | Input: Bool, Int, Str or an Enum | `inputs.selector` |
+| `failed`, `error` (Try) | Outputs: whether the body failed (Bool), and the error message (Str, empty if it did not) | |
+| `error`, `error_type` (Try) | | In the handler only: `inputs.error`, the message, and `inputs.error_type`, the name of the exception class |
+| `resource` (With) | Input: a context manager | `inputs.resource`: what entering it returned |
 
 Tunnel objects have `name` and `mode`, and optionally `type` (a declared
 type; values are converted to it) and `fallback` (output tunnels in mode
 `last`: the value when no iteration ran, or when the chosen case frame leaves
 the output unwired). The names `i`, `count`, `stop` and `selector` are
-reserved. Input names are unique among inputs and registers, output names
+reserved everywhere; `error`, `error_type` and `failed` in a Try, `resource`
+in a With. Input names are unique among inputs and registers, output names
 among outputs and registers.
+
+A For loop without shift registers may carry `"parallel": true`: its
+iterations are independent, so they may run at the same time. Results keep
+their order.
+
+An output of a Try is wired in both frames, or has a fallback, and takes the
+join of the two types, like a case structure. A Try catches the failure of a
+node (`NodeError`), not Stop. A With structure always leaves its context
+manager, passing it the node's exception if the frame failed. If the context
+manager swallows the error, the outputs take their fallbacks.
 
 A case structure has `cases`, one entry per frame: a list of values (and, for
 integers, inclusive ranges written `{"range": [lo, hi]}`), or `null` for the
@@ -267,16 +283,97 @@ Problems inside a structure name the node by its path: `loop/add` is node
 `add` in the frame of `loop`, `choose[1]/add` is in frame 1 of the case
 structure `choose`.
 
-`run(graph)` refuses a graph with errors, then executes nodes in dependency
-order; among nodes that are ready, the smallest id goes first, so the order
-never depends on editing history. Guarantees:
+`run(graph)` refuses a graph with errors, then executes its nodes. With one
+worker that is in dependency order; among nodes that are ready, the smallest
+id goes first, so the order never depends on editing history. With more
+workers, independent nodes overlap (see Parallel execution). Guarantees:
 
 - A node runs only after everything it reads from has finished.
 - Literals and config values reach a node as private copies.
 - A failure raises `NodeError` naming the node (by path inside structures), with the original exception as its cause. `context` lists where it happened, innermost first: `["iteration 2 of 'loop'"]`. Nothing downstream runs.
-- A listener receives `graph-started`, `node-started`, `node-finished`, `node-failed`, `node-warning`, `graph-finished` or `graph-failed`.
+- A listener receives `graph-started`, `node-started`, `node-finished`, `node-failed`, `node-warning`, `node-cached`, `graph-finished` or `graph-failed`.
 - `run(..., cancel=fn)` calls `fn` before every node and every loop iteration and stops with `Cancelled` when it returns true.
 - Only the chosen frame of a case structure runs.
+
+### Parallel execution
+
+Nodes that do not depend on each other may run at the same time. Nobody has
+to ask for it: `run` starts every node as soon as its inputs are there.
+
+- `run(..., workers=N)` limits how many nodes run at once. The default is the
+  number of processors, at least 2 and at most 8. `workers=1` runs one node
+  at a time, in the order of the node ids.
+- The value semantics above are what make this safe: a value shared by two
+  branches is read-only, and a node that writes has its own copy.
+- Nodes with side effects (`pure: false`: files, clocks, random numbers) never
+  overtake each other. Within a diagram they run one after the other, in the
+  order they would have with one worker. A structure that contains such a
+  node counts as one. Wire one into the other to force a different order.
+- A spec with `thread_safe: false` shares one lock with every other node of
+  its library (the first part of the spec id), so they run one at a time.
+- An object with reference semantics (an `Object` wire) is used by one node at
+  a time.
+- When a node fails, nothing new starts in its diagram, the nodes already
+  running finish, and structures still running inside the diagram stop at
+  their next node. If several nodes fail at once, the one that comes first
+  in the one-worker order is reported.
+- A listener is called with one event at a time, but the events of nodes
+  that run together arrive in no fixed order. `cancel` may be called from
+  several threads.
+
+Where a node runs is the `executor` of its spec:
+
+| Executor | Runs | For |
+| --- | --- | --- |
+| `inline` | In the thread that schedules the diagram | Cheap nodes: the base palette |
+| `thread` (the default) | On a thread pool, when something else can run meanwhile | Library calls. NumPy, SciPy and file I/O release the interpreter lock in their heavy operations |
+| `process` | In a worker process | Pure-Python work that should use another processor, and libraries that crash or cannot share a process |
+
+The runtime measures every node. One that proves cheaper than 0.2 ms is run
+in the scheduling thread from then on, and a diagram in which no two heavy
+nodes could ever overlap is run in order, with no scheduling at all. A chain
+of nodes therefore costs what it did before.
+
+Worker processes are started on first use (`openramen.runtime.workers.start()`
+starts them ahead of time) and kept. Arrays of 256 kB or more travel through
+shared memory: an array is copied once on its way in and once on its way
+out, and an array that came out of a worker goes into the next one without a
+copy. Such arrays are read-only in the main process. A node whose pins have
+`Object`, `Callable` or `Iterator` types stays in the main process, and so does
+a node whose function or arguments turn out not to be picklable (reported as
+a `node-warning`). If a worker dies, the node fails with a `NodeError` and a
+new worker takes its place. Workers are started with the `spawn` method, so a
+script that uses process nodes needs the usual `if __name__ == "__main__":`
+guard around the code that runs the graph.
+
+### Stop
+
+`start(graph, ...)` checks the graph, runs it on a background thread and
+returns a `Run`: `cancel()` asks it to stop, `wait(timeout)` and `done` tell
+whether it is over, `result(timeout)` returns the values or raises what
+stopped the run. Stop takes effect before the next node and before every loop
+iteration. A node that is already running finishes first, except in a worker
+process, which is killed.
+
+### Caching
+
+`run(..., cache=Cache(max_bytes=...))` keeps the outputs of pure nodes. A node
+whose inputs are what they were in an earlier run with the same cache is not
+run again; the listener receives `node-cached` for it.
+
+- Only the top level of a graph is looked up. A structure is cached as a
+  whole if everything inside it is pure.
+- "The same inputs" means equal content for constants, literals, numbers and
+  short text, and "produced by the same node from the same inputs" for
+  everything else. A node with side effects always runs; what follows it is
+  reused only when it returns a number or short text equal to last time.
+- A node whose configuration holds something with no stable content (an open
+  file, a lock) is not cached.
+- When the memory budget is exceeded, the values used least recently are
+  dropped, and computed again when next needed. Nothing downstream of them
+  is lost by that.
+- Arrays that have been through a cache are read-only: they are shared
+  between runs.
 
 ### Value semantics
 
@@ -396,13 +493,15 @@ types. From then on they are checked on every run.
 
 ## 6. Not specified yet
 
-Parallel executors, caching, cancellation of a node that is already running,
-Try and With structures, and the front panel. Each gets its section here when
-its milestone lands.
+The front panel and the editor, which get their sections when their milestone
+lands.
+
+Still open in running: moving a node between executors by itself when it
+proves slow or holds the interpreter lock, caching inside structures,
+error wires as an alternative to Try, and an event structure.
 
 Still open in structures: a conditional `collect` (keep only some
-iterations), running the iterations of a For loop in parallel, a Script node,
-and exporting a graph as plain Python.
+iterations), a Script node, and exporting a graph as plain Python.
 
 Still open in the importer: classes and their methods, reading stub files
 (`.pyi`), a disk cache of built specs, and flagging nodes whose function

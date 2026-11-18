@@ -76,6 +76,35 @@ def test_normalise_rows():
     assert str(analysis.out_type("rows", "peaks")) == "Array[float64, 1]"
 
 
+def test_safe_division():
+    graph = Graph.load(EXAMPLES / "safe_division.json")
+    numerators = graph.node("numerators").config["value"]
+    divisors = graph.node("divisors").config["value"]
+    quotients, failures = [], 0
+    for a, b in zip(numerators, divisors):
+        try:
+            quotients.append(a // b)
+        except ZeroDivisionError:
+            quotients.append(-1)
+            failures += 1
+    for workers in (1, 4):
+        result = run(graph, check_outputs=True, workers=workers)
+        assert result["loop"] == {"quotients": quotients, "failures": failures}
+
+
+def test_parallel_branches():
+    import numpy as np
+    graph = Graph.load(EXAMPLES / "parallel_branches.json")
+    image = graph.node("image").config["value"]
+    plan = ramen.compile_graph(graph)
+    assert plan.schedule is not None                 # two branches can run at once
+    for workers in (1, 4):
+        result = run(plan, workers=workers)
+        assert np.array_equal(result["sorted"], np.sort(image, axis=1))
+        assert np.array_equal(result["running_total"], np.cumsum(image, axis=0))
+        assert np.array_equal(result["rows"], image.max(axis=1))
+
+
 def test_arithmetic():
     graph = Graph.load(EXAMPLES / "arithmetic.json")
     analysis = analyze(graph)
@@ -151,6 +180,13 @@ class TestCommandLine:
         graph.save(tmp_path / "broken.json")
         assert main(["check", str(tmp_path / "broken.json")]) == 1
         assert "[loop.stop]" in capsys.readouterr().out
+
+    def test_run_with_one_worker(self, capsys):
+        path = str(EXAMPLES / "safe_division.json")
+        for options in (["--workers", "1"], ["--workers", "4"], []):
+            assert main(["run", path, *options]) == 0
+            assert capsys.readouterr().out == (
+                "loop.quotients = [5, -1, 3, -1]\nloop.failures = 2\n")
 
     def test_run_selected_nodes(self, capsys):
         path = str(EXAMPLES / "arithmetic.json")

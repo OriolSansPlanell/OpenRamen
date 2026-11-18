@@ -1,0 +1,40 @@
+{
+  "format": "openramen.graph",
+  "version": 2,
+  "name": "parallel branches",
+  "imports": ["numpy"],
+  "nodes": [
+    {"id": "image", "spec": "base.constant", "config": {"value": {"$ndarray": {"dtype": "float64", "shape": [4, 6], "data": [0.64, 0.27, 0.04, 0.02, 0.81, 0.91, 0.61, 0.73, 0.54, 0.94, 0.82, 0.0, 0.86, 0.03, 0.73, 0.18, 0.86, 0.54, 0.3, 0.42, 0.03, 0.12, 0.67, 0.65]}}}, "pos": [0.0, 80.0]},
+    {
+      "id": "rows",
+      "spec": "structure.for",
+      "pos": [240.0, 260.0],
+      "structure": {
+        "kind": "for",
+        "inputs": [{"name": "row", "mode": "index"}],
+        "outputs": [{"name": "brightest", "mode": "stack"}],
+        "parallel": true,
+        "frames": [
+          {
+            "nodes": [
+              {"id": "inputs", "spec": "frame.inputs", "pos": [0.0, 20.0]},
+              {"id": "outputs", "spec": "frame.outputs", "pos": [360.0, 20.0]},
+              {"id": "peak", "spec": "numpy.max", "pos": [160.0, 0.0]}
+            ],
+            "wires": [
+              ["inputs", "row", "peak", "a"],
+              ["peak", "out", "outputs", "brightest"]
+            ]
+          }
+        ]
+      }
+    },
+    {"id": "running_total", "spec": "numpy.cumsum", "values": {"axis": 0}, "pos": [240.0, 120.0]},
+    {"id": "sorted", "spec": "numpy.sort", "values": {"axis": 1}, "pos": [240.0, 0.0]}
+  ],
+  "wires": [
+    ["image", "out", "rows", "row"],
+    ["image", "out", "running_total", "a"],
+    ["image", "out", "sorted", "a"]
+  ]
+}

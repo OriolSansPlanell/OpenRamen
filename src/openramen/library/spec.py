@@ -208,7 +208,11 @@ class NodeSpec:
     # -- lookups ------------------------------------------------------------
 
     def input(self, name: str) -> Optional[PinSpec]:
-        return next((p for p in self.inputs if p.name == name), None)
+        try:
+            return self._inputs.get(name)             # type: ignore[attr-defined]
+        except AttributeError:
+            object.__setattr__(self, "_inputs", {p.name: p for p in self.inputs})
+            return self._inputs.get(name)             # type: ignore[attr-defined]
 
     def output(self, name: str) -> Optional[PinSpec]:
         return next((p for p in self.outputs if p.name == name), None)

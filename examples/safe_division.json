@@ -1,0 +1,75 @@
+{
+  "format": "openramen.graph",
+  "version": 2,
+  "name": "safe division",
+  "nodes": [
+    {"id": "divisors", "spec": "base.constant", "config": {"value": [2, 0, 3, 0]}, "pos": [0.0, 120.0]},
+    {
+      "id": "loop",
+      "spec": "structure.for",
+      "values": {"failures": 0},
+      "pos": [240.0, 0.0],
+      "structure": {
+        "kind": "for",
+        "inputs": [{"name": "a", "mode": "index"}, {"name": "b", "mode": "index"}],
+        "outputs": [{"name": "quotients", "mode": "collect"}],
+        "registers": ["failures"],
+        "frames": [
+          {
+            "nodes": [
+              {"id": "as_number", "spec": "base.to_int", "pos": [380.0, 160.0]},
+              {
+                "id": "attempt",
+                "spec": "structure.try",
+                "pos": [160.0, 0.0],
+                "structure": {
+                  "kind": "try",
+                  "inputs": [{"name": "a", "mode": "plain"}, {"name": "b", "mode": "plain"}],
+                  "outputs": [{"name": "q", "mode": "last"}],
+                  "frames": [
+                    {
+                      "nodes": [
+                        {"id": "divide", "spec": "base.floor_divide", "pos": [140.0, 0.0]},
+                        {"id": "inputs", "spec": "frame.inputs"},
+                        {"id": "outputs", "spec": "frame.outputs"}
+                      ],
+                      "wires": [
+                        ["divide", "out", "outputs", "q"],
+                        ["inputs", "a", "divide", "a"],
+                        ["inputs", "b", "divide", "b"]
+                      ]
+                    },
+                    {
+                      "nodes": [
+                        {"id": "inputs", "spec": "frame.inputs"},
+                        {"id": "outputs", "spec": "frame.outputs", "values": {"q": -1}}
+                      ],
+                      "wires": []
+                    }
+                  ]
+                }
+              },
+              {"id": "count", "spec": "base.add", "pos": [540.0, 160.0]},
+              {"id": "inputs", "spec": "frame.inputs", "pos": [0.0, 60.0]},
+              {"id": "outputs", "spec": "frame.outputs", "pos": [700.0, 60.0]}
+            ],
+            "wires": [
+              ["as_number", "out", "count", "b"],
+              ["attempt", "failed", "as_number", "x"],
+              ["attempt", "q", "outputs", "quotients"],
+              ["count", "out", "outputs", "failures"],
+              ["inputs", "a", "attempt", "a"],
+              ["inputs", "b", "attempt", "b"],
+              ["inputs", "failures", "count", "a"]
+            ]
+          }
+        ]
+      }
+    },
+    {"id": "numerators", "spec": "base.constant", "config": {"value": [10, 7, 9, 4]}}
+  ],
+  "wires": [
+    ["divisors", "out", "loop", "b"],
+    ["numerators", "out", "loop", "a"]
+  ]
+}

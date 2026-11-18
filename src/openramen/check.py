@@ -7,6 +7,7 @@ runnable when it has no problem of severity ``"error"``.
 
 from __future__ import annotations
 
+import typing
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -209,15 +210,47 @@ def interface(node: Structure) -> NodeSpec:
                               doc="Number of iterations."))
     if node.kind == "case":
         inputs.append(PinSpec("selector", T.ANY, doc="Chooses the frame that runs."))
+    if node.kind == "with":
+        inputs.append(PinSpec("resource", T.ANY,
+                              doc="A context manager: entered before the frame runs, "
+                                  "left when it is done."))
     inputs += [PinSpec(t.name, declared(t)) for t in node.inputs]
     inputs += [PinSpec(r, T.ANY, doc="Initial value of the shift register.")
                for r in node.registers]
     outputs = [PinSpec(t.name, T.ANY) for t in node.outputs]
     outputs += [PinSpec(r, T.ANY, doc="Final value of the shift register.")
                 for r in node.registers]
+    if node.kind == "try":
+        outputs += [PinSpec("failed", T.BOOL, doc="True if the body failed."),
+                    PinSpec("error", T.STR, doc="The error message, or an empty text.")]
     return NodeSpec(f"structure.{node.kind}", inputs=tuple(inputs), outputs=tuple(outputs),
                     fn=_nothing, tier="curated", executor="inline",
                     summary=f"{node.kind.capitalize()} structure.")
+
+
+def entered_type(resource: T.Type) -> Optional[T.Type]:
+    """What a With structure hands to its frame for a resource of this type,
+    or ``None`` if that type cannot be a context manager."""
+    if isinstance(resource, (T.AnyT, T.VarT, T.UnionT)):
+        return T.ANY
+    if not isinstance(resource, T.ObjectT):
+        return None
+    cls = T._resolve_class(resource.cls)
+    if cls is None:
+        return T.ANY
+    enter = getattr(cls, "__enter__", None)
+    if enter is None or getattr(cls, "__exit__", None) is None:
+        return None
+    try:
+        returns = typing.get_type_hints(enter).get("return")
+    except Exception:
+        returns = None
+    if returns is None:
+        return T.ANY
+    if returns is cls or isinstance(returns, typing.TypeVar) or returns is getattr(
+            typing, "Self", object()):
+        return resource
+    return T.from_annotation(returns)
 
 
 def boundary_specs(in_types: dict[str, T.Type], out_pins: list[str]
@@ -436,8 +469,25 @@ class _Checker:
         info.data = {"registers": {}, "outputs": {}, "convert": {}}
 
         if node.kind == "case":
-            self._case(node, info, inner, out_pins, path, problems, error)
+            selector = info.received.get("selector") or T.ANY
+            inner["selector"] = selector
+            self._check_cases(node, selector, error)
+            self._branches(node, info, [inner] * len(node.frames), out_pins, path, problems,
+                           error)
             return
+        if node.kind == "try":
+            handler = dict(inner, error=T.STR, error_type=T.STR)
+            self._branches(node, info, [inner, handler], out_pins, path, problems, error)
+            info.out_types.update(failed=T.BOOL, error=T.STR)
+            return
+        if node.kind == "with":
+            resource = received.get("resource") or T.ANY
+            entered = entered_type(resource)
+            if entered is None:
+                error("type-mismatch",
+                      f"'resource' must be a context manager, not {resource}", "resource")
+                entered = T.ANY
+            inner["resource"] = entered
 
         if node.kind == "for":
             inner["i"] = T.INT
@@ -552,13 +602,12 @@ class _Checker:
         info.out_types[tunnel.name] = out_type
         info.data["outputs"][tunnel.name] = (tunnel.mode, got, out_type)
 
-    def _case(self, node: Structure, info: NodeInfo, inner: dict[str, T.Type],
-              out_pins: list[str], path: str, problems: list[Problem], error: Any) -> None:
-        selector = info.received.get("selector") or T.ANY
-        inner["selector"] = selector
-        self._check_cases(node, selector, error)
+    def _branches(self, node: Structure, info: NodeInfo, inners: list[dict[str, T.Type]],
+                  out_pins: list[str], path: str, problems: list[Problem], error: Any) -> None:
+        """Structures of which one frame runs: every output takes the join of
+        what the frames deliver."""
         analyses = []
-        for index, frame in enumerate(node.frames):
+        for index, (frame, inner) in enumerate(zip(node.frames, inners)):
             analyses.append(self.graph(frame, boundary_specs(inner, out_pins),
                                        f"{path}{node.id}[{index}]/", problems))
         info.frames = analyses

@@ -10,7 +10,7 @@ import random
 
 import pytest
 
-from openramen import Graph, analyze, run
+from openramen import Cache, Graph, NodeError, analyze, run
 from openramen.model import UNSET
 
 OPS = {"base.add": operator.add, "base.subtract": operator.sub,
@@ -26,15 +26,24 @@ class Generator:
         self.counter += 1
         return f"{prefix}{self.counter}"
 
-    def body(self, ints, lists, depth):
+    def body(self, ints, lists, depth, risky=0.02):
         """Statements that may use the given variables; returns them together
-        with the variables that exist afterwards."""
+        with the variables that exist afterwards.  ``risky`` is the chance of
+        a division, which fails when the divisor happens to be zero."""
         rng = self.rng
         ints, lists = list(ints), list(lists)
         statements = []
         for _ in range(rng.randint(1, 4)):
             roll = rng.random()
-            if depth < 3 and roll < 0.22:
+            if rng.random() < risky:
+                out, divisor = self.fresh(), rng.choice(ints)
+                if rng.random() < 0.6:               # a divisor that is zero half the time
+                    statements.append(("mod", self.fresh(), divisor, 2))
+                    divisor = statements[-1][1]
+                statements.append(("div", out, rng.choice(ints), divisor))
+            elif depth < 3 and roll < 0.08:
+                statements.append(self.attempt(ints, lists, depth))
+            elif depth < 3 and roll < 0.22:
                 statements.append(self.for_loop(ints, lists, depth))
             elif depth < 3 and roll < 0.32:
                 statements.append(self.while_loop(ints, lists, depth))
@@ -64,7 +73,7 @@ class Generator:
                     lists.append(details["collect"][0])
                 if details.get("last"):
                     ints.append(details["last"][0])
-            elif produced[0] == "case":
+            elif produced[0] in ("case", "try"):
                 ints.append(produced[1]["out"])
             else:
                 ints.append(produced[1])
@@ -88,6 +97,17 @@ class Generator:
                 for r, _, kind in regs}
         collect = (self.fresh(), self.rng.choice(body_ints)) if self.rng.random() < 0.6 else None
         return body, feed, collect, body_ints
+
+    def attempt(self, ints, lists, depth):
+        """try: <body, likely to divide by zero>  except: <handler>."""
+        body, body_ints, _ = self.body(ints, lists, depth + 1, risky=0.5)
+        handler, handler_ints, _ = self.body(ints, lists, depth + 1)
+        fallback = self.rng.randint(-9, 9) if self.rng.random() < 0.3 else UNSET
+        return ("try", {"id": self.fresh("s"), "out": self.fresh(), "failed": self.fresh("f"),
+                        "body": body, "result": self.rng.choice(body_ints),
+                        "handler": handler, "fallback": fallback,
+                        "handled": None if fallback is not UNSET
+                        else self.rng.choice(handler_ints)})
 
     def for_loop(self, ints, lists, depth):
         rng = self.rng
@@ -161,6 +181,19 @@ def execute(statements, env):
             env[statement[1]] = env[statement[2]] % statement[3]
         elif kind == "append":
             env[statement[1]] = env[statement[2]] + [env[statement[3]]]
+        elif kind == "div":
+            env[statement[1]] = env[statement[2]] // env[statement[3]]
+        elif kind == "try":
+            d = statement[1]
+            inner = dict(env)
+            try:
+                execute(d["body"], inner)
+                env[d["out"]], env[d["failed"]] = inner[d["result"]], False
+            except ZeroDivisionError:
+                inner = dict(env)
+                execute(d["handler"], inner)
+                env[d["out"]] = d["fallback"] if d["handled"] is None else inner[d["handled"]]
+                env[d["failed"]] = True
         elif kind == "for":
             d = statement[1]
             if "bound" in d:
@@ -236,9 +269,26 @@ def enter(structure, graph, src):
 def build(statements, graph, src):
     for statement in statements:
         kind = statement[0]
-        if kind in ("op", "scale", "mod", "append"):
+        if kind == "try":
+            d = statement[1]
+            attempt = graph.add_try(d["id"])
+            attempt.add_output(d["out"], fallback=d["fallback"])
+            inner = enter(attempt, graph, src)
+            build(d["body"], attempt.frames[0], inner)
+            attempt.frames[0].connect(*inner[d["result"]], "outputs", d["out"])
+            inner = {name: ("inputs", name) for name in src}
+            build(d["handler"], attempt.frames[1], inner)
+            if d["handled"] is not None:
+                attempt.frames[1].connect(*inner[d["handled"]], "outputs", d["out"])
+            src[d["out"]] = (attempt.id, d["out"])
+            src[d["failed"]] = (attempt.id, "failed")
+        elif kind in ("op", "scale", "mod", "append", "div"):
             out = statement[1]
-            if kind == "append":
+            if kind == "div":
+                graph.add_node("base.floor_divide", out)
+                graph.connect(*src[statement[2]], out, "a")
+                graph.connect(*src[statement[3]], out, "b")
+            elif kind == "append":
                 graph.add_node("base.list_append", out)
                 graph.connect(*src[statement[2]], out, "items")
                 graph.connect(*src[statement[3]], out, "item")
@@ -318,8 +368,24 @@ def program(seed):
         graph.add_node("base.constant", name, config={"value": value})
         src[name] = (name, "out")
     build(statements, graph, src)
-    execute(statements, env)
+    try:
+        execute(statements, env)
+    except ZeroDivisionError:
+        return graph, src, None                     # the program fails, in Python too
     return graph, src, env
+
+
+def compare(graph, src, expected, **options):
+    """Run a program as a graph; it must do what plain Python did."""
+    if expected is None:
+        with pytest.raises(NodeError) as info:
+            run(graph, **options)
+        assert isinstance(info.value.original, ZeroDivisionError)
+        return
+    result = run(graph, check_outputs=True, **options)
+    for name, source in src.items():
+        got = result.values[source]
+        assert got == expected[name] and type(got) is type(expected[name]), (name, source)
 
 
 @pytest.mark.parametrize("seed", range(400))
@@ -327,15 +393,24 @@ def test_random_programs_match_plain_python(seed):
     graph, src, expected = program(seed)
     analysis = analyze(graph)
     assert analysis.ok, analysis.problems
-    for attempt in (graph, Graph.loads(graph.dumps())):
-        result = run(attempt, check_outputs=True, detect_mutation=attempt is graph)
-        for name, source in src.items():
-            got = result.values[source]
-            assert got == expected[name] and type(got) is type(expected[name]), (name, source)
+    compare(graph, src, expected, detect_mutation=True, workers=1)
+    compare(Graph.loads(graph.dumps()), src, expected)
+    cache = Cache()
+    compare(graph, src, expected, cache=cache)
+    misses = cache.misses
+    compare(graph.copy(), src, expected, cache=cache)       # everything pure is found again
+    assert cache.misses == misses or expected is None
+
+
+@pytest.mark.parametrize("seed", range(400))
+def test_random_programs_match_plain_python_on_many_threads(seed, stress):
+    """The same programs with every node, loop and case handed to another thread."""
+    graph, src, expected = program(seed)
+    compare(graph, src, expected, workers=4)
 
 
 def test_the_programs_are_worth_running():
-    kinds = {"for": 0, "while": 0, "case": 0, "nested": 0}
+    kinds = {"for": 0, "while": 0, "case": 0, "nested": 0, "try": 0, "div": 0}
 
     def count(statements, depth):
         for statement in statements:
@@ -348,6 +423,12 @@ def test_the_programs_are_worth_running():
                 kinds["nested"] += depth > 0
                 for _, body, _ in statement[1]["frames"]:
                     count(body, depth + 1)
+            elif statement[0] == "try":
+                kinds["try"] += 1
+                count(statement[1]["body"], depth + 1)
+                count(statement[1]["handler"], depth + 1)
+            elif statement[0] == "div":
+                kinds["div"] += 1
 
     for seed in range(400):
         generator = Generator(seed)
@@ -356,6 +437,10 @@ def test_the_programs_are_worth_running():
         [rng.randint(-20, 20) for _ in range(3)]
         count(generator.body(ints, [generator.fresh("k")], 0)[0], 0)
     assert min(kinds.values()) > 100, kinds
+    outcomes = [program(seed)[2] for seed in range(400)]
+    failing = sum(env is None for env in outcomes)
+    caught = sum(any(value is True for value in env.values()) for env in outcomes if env)
+    assert 10 < failing < 150 and caught > 15, (failing, caught)   # caught at the top level
 
 
 # -- damaged programs ---------------------------------------------------------------
@@ -401,7 +486,8 @@ def damage(graph, rng):
             structure.registers.remove(rng.choice(structure.registers))
     elif roll == 7 and structures:
         structure = rng.choice(structures)
-        structure.kind = rng.choice(["for", "while", "case", "subgraph"])
+        structure.kind = rng.choice(["for", "while", "case", "subgraph", "try", "with"])
+        structure.parallel = rng.random() < 0.3
     elif roll == 8 and structures:
         structure = rng.choice(structures)
         if structure.outputs:
@@ -429,7 +515,6 @@ def damage(graph, rng):
 
 @pytest.mark.parametrize("seed", range(300))
 def test_damaged_programs_are_reported_not_crashed_on(seed):
-    from openramen import NodeError
     graph, _, _ = program(seed)
     rng = random.Random(seed * 7919)
     for _ in range(rng.randint(1, 4)):

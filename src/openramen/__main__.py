@@ -45,7 +45,7 @@ def _run(args: argparse.Namespace) -> int:
         return 1
     try:
         result = run(graph, targets=args.node or None,
-                     detect_mutation=args.detect_mutation)
+                     detect_mutation=args.detect_mutation, workers=args.workers)
     except KeyError as exc:
         print(f"error: {exc.args[0]}", file=sys.stderr)
         return 2
@@ -100,6 +100,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_run.add_argument("file")
     p_run.add_argument("--node", action="append", metavar="ID",
                        help="only run and print this node (repeatable)")
+    p_run.add_argument("--workers", type=int, default=None, metavar="N",
+                       help="how many nodes may run at the same time (1: one after the other)")
     p_run.add_argument("--detect-mutation", action="store_true",
                        help="fail if a node changes a list or dict it did not declare it writes")
     p_run.set_defaults(func=_run)

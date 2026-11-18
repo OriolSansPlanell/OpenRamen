@@ -17,8 +17,14 @@ from __future__ import annotations
 
 import copy
 import enum
+import heapq
+import itertools
+import os
 import re
+import sys
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import Any, Callable, Iterable, Iterator, Optional, Union
@@ -28,10 +34,13 @@ import numpy as np
 from .. import types as T
 from ..check import Analysis, GraphCheckError, analyze
 from ..library import NodeSpec, Registry
-from ..model import FRAME_IN, FRAME_OUT, INPUTS, UNSET, Graph, Structure
+from ..model import FRAME_IN, FRAME_OUT, INPUTS, UNSET, Graph, Structure, _structure_to_dict
+from . import cache as _cache
+from . import workers as _workers
+from .cache import Cache
 
 __all__ = ["Plan", "Step", "StructurePlan", "Event", "RunResult", "NodeError", "Cancelled",
-           "GraphCheckError", "compile_graph", "run"]
+           "GraphCheckError", "Run", "Cache", "compile_graph", "run", "start", "default_workers"]
 
 _PASS, _CONVERT, _ACCEPT = 0, 1, 2           # what a wire does to its value
 _READ, _MUTATE, _IN_PLACE = 0, 1, 2          # how the receiving pin uses it
@@ -43,6 +52,8 @@ _READ_ONLY = re.compile(r"read[- ]?only|not writ(?:e)?able", re.I)
 _NEEDS_WRITABLE: set[str] = set()
 #: Specs the mutation detector has seen leave their inputs alone.
 _VERIFIED: set[tuple[str, str]] = set()
+#: Specs that asked for a worker process but turned out not to be sendable.
+_LOCAL_ONLY: set[str] = set()
 
 
 class Cancelled(Exception):
@@ -118,6 +129,29 @@ class Step:
     needs: frozenset[str] = field(default_factory=frozenset)  # upstream node ids
     structure: Optional[StructurePlan] = None
     boundary: str = ""           # "in" or "out" for the boundary nodes of a frame
+    #: Same inputs, same outputs, no side effects (for a structure: everything in it).
+    pure: bool = True
+    #: Worth another thread: a library call, or a structure that contains one.
+    heavy: bool = False
+    #: Measured run time in seconds, smoothed; negative while unknown.
+    cost: float = -1.0
+    #: For the cache: a fingerprint of everything fixed about this node (its
+    #: function, configuration and literals).  Empty: cannot be cached.
+    #: ``None``: not worked out yet.
+    identity: Optional[bytes] = field(default=None, repr=False)
+    #: Runs in a worker process.
+    remote: bool = False
+    #: May receive an object with reference semantics, which only one node
+    #: may use at a time.
+    guarded: bool = False
+
+
+@dataclass
+class _Schedule:
+    """What the parallel scheduler needs to know about a diagram."""
+
+    pending: list[int]                    # per step: how many steps it waits for
+    consumers: list[tuple[int, ...]]      # per step: the steps waiting for it
 
 
 @dataclass
@@ -127,6 +161,17 @@ class Plan:
     name: str
     steps: list[Step]
     analysis: Analysis
+    #: Set when two heavy nodes could run at the same time; ``None`` means
+    #: running the steps in order loses nothing.
+    schedule: Optional[_Schedule] = None
+
+    @property
+    def pure(self) -> bool:
+        return all(step.pure for step in self.steps)
+
+    @property
+    def heavy(self) -> bool:
+        return any(step.heavy for step in self.steps)
 
 
 class RunResult:
@@ -207,9 +252,80 @@ def _plan(graph: Graph, analysis: Analysis) -> Plan:
             if node.kind in ("for", "while"):
                 structure.in_place = _in_place_registers(frames[0], node.registers)
         boundary = {FRAME_IN: "in", FRAME_OUT: "out"}.get(info.spec.id, "")
+        if structure is None:
+            pure = info.spec.pure
+            heavy = (info.spec.executor != "inline" or _EVERYTHING_HEAVY) and not boundary
+        else:
+            # a With structure opens and closes a resource: that is a side effect
+            pure = structure.node.kind != "with" and all(f.pure for f in structure.frames)
+            heavy = not _GIL or _EVERYTHING_HEAVY or any(f.heavy for f in structure.frames)
+        guarded = structure is None and not boundary and (
+            any(_may_be_object(analysis.nodes[wire.src].out_types.get(wire.src_pin, T.ANY))
+                for wire, _ in info.wires.values())
+            or any(not isinstance(value, _VALUES) for value in info.literals.values()))
         steps.append(Step(nid, info.spec, wired, dict(info.literals), dict(info.config),
-                          dict(info.out_types), needs[nid], structure, boundary))
-    return Plan(graph.name, steps, analysis)
+                          dict(info.out_types), needs[nid], structure, boundary, pure, heavy,
+                          remote=structure is None and _is_remote(info.spec), guarded=guarded))
+    return Plan(graph.name, steps, analysis, _schedule(steps))
+
+
+def _may_be_object(t: T.Type) -> bool:
+    """Whether a wire of this type can carry an object with reference
+    semantics (as opposed to a number, text, an array or a container)."""
+    if isinstance(t, (T.ScalarT, T.ArrayT, T.EnumT)):
+        return False
+    if isinstance(t, (T.ListT, T.IteratorT)):
+        return _may_be_object(t.elem)
+    if isinstance(t, T.TupleT):
+        return any(_may_be_object(e) for e in t.elems)
+    if isinstance(t, T.DictT):
+        return _may_be_object(t.key) or _may_be_object(t.value)
+    if isinstance(t, T.UnionT):
+        return any(_may_be_object(o) for o in t.options)
+    return True                 # Any, type variables, records, objects, callables
+
+
+def _is_remote(spec: NodeSpec) -> bool:
+    """Whether a node runs in a worker process.  Objects with reference
+    semantics cannot leave this process, so a node with such a pin stays."""
+    if spec.executor != "process":
+        return False
+    return not any(isinstance(pin.type, (T.ObjectT, T.CallableT, T.IteratorT))
+                   for pin in spec.inputs + spec.outputs + spec.config)
+
+
+def _schedule(steps: list[Step]) -> Optional[_Schedule]:
+    """Dependency counts for running ``steps`` in parallel, or ``None`` if no
+    two heavy steps could ever run at the same time.
+
+    Nodes with side effects are chained in their order, so they never
+    overtake each other.
+    """
+    if sum(step.heavy for step in steps) < 2:
+        return None
+    index = {step.node: i for i, step in enumerate(steps)}
+    depends: list[set[int]] = []
+    upstream: list[set[int]] = []
+    impure: Optional[int] = None
+    for i, step in enumerate(steps):
+        direct = {index[source[0]] for _, source, _, _, _ in step.wired if source[0] in index}
+        if not step.pure:
+            if impure is not None:
+                direct.add(impure)
+            impure = i
+        depends.append(direct)
+        closure = set(direct)
+        for j in direct:
+            closure |= upstream[j]
+        upstream.append(closure)
+    heavy = [i for i, step in enumerate(steps) if step.heavy]
+    if all(a in upstream[b] for k, b in enumerate(heavy) for a in heavy[:k]):
+        return None
+    consumers: list[list[int]] = [[] for _ in steps]
+    for i, direct in enumerate(depends):
+        for j in direct:
+            consumers[j].append(i)
+    return _Schedule([len(direct) for direct in depends], [tuple(c) for c in consumers])
 
 
 def _in_place_registers(frame: Plan, registers: list[str]) -> set[str]:
@@ -253,7 +369,12 @@ def _in_place_registers(frame: Plan, registers: list[str]) -> set[str]:
 
 def _fresh(value: Any) -> Any:
     """A private copy of a literal, so no node can alter the graph's own."""
-    return value if isinstance(value, _IMMUTABLE) else copy.deepcopy(value)
+    if isinstance(value, _IMMUTABLE):
+        return value
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value      # an object that cannot be copied has reference semantics anyway
 
 
 def _private(value: Any) -> Any:
@@ -295,12 +416,124 @@ def _same(a: Any, b: Any) -> bool:
 # Running
 # --------------------------------------------------------------------------
 
+#: A step that has proved cheaper than this (seconds) is run in the
+#: scheduling thread: handing it to a pool would cost more than it saves.
+_CHEAP = 200e-6
+_GIL = getattr(sys, "_is_gil_enabled", lambda: True)()
+#: For tests: plan every node as if it were worth a thread of its own.
+_EVERYTHING_HEAVY = False
+
+_POOLS: dict[int, ThreadPoolExecutor] = {}
+_COORDINATORS: list[ThreadPoolExecutor] = []
+_POOL_LOCK = threading.Lock()
+#: Threads that run the frames of structures.  They are taken only when one
+#: is free and never waited for, so nested structures cannot starve each other.
+_SLOTS = threading.BoundedSemaphore(64)
+#: One lock per library whose nodes are not thread-safe.
+_LIBRARY_LOCKS: dict[str, threading.RLock] = {}
+#: Locks for objects with reference semantics: two nodes never use the same
+#: object at the same time.  Striped by address, so nothing is stored per object.
+_STRIPES = [threading.Lock() for _ in range(64)]
+_VALUES = _IMMUTABLE + (np.ndarray, np.generic, list, dict, tuple, set, frozenset,
+                        bytearray, enum.Enum)
+
+
+def default_workers() -> int:
+    """How many nodes run at the same time unless ``run`` is told otherwise."""
+    return max(2, min(8, os.cpu_count() or 2))
+
+
+def _pool(workers: int) -> ThreadPoolExecutor:
+    pool = _POOLS.get(workers)
+    if pool is None:
+        with _POOL_LOCK:
+            pool = _POOLS.get(workers)
+            if pool is None:
+                pool = _POOLS[workers] = ThreadPoolExecutor(
+                    workers, thread_name_prefix="openramen-node")
+    return pool
+
+
+def _coordinators() -> ThreadPoolExecutor:
+    if not _COORDINATORS:
+        with _POOL_LOCK:
+            if not _COORDINATORS:
+                _COORDINATORS.append(ThreadPoolExecutor(64, thread_name_prefix="openramen-frame"))
+    return _COORDINATORS[0]
+
+
+def _forget_pools() -> None:
+    """Threads do not survive a fork: a child process starts its pools afresh."""
+    global _POOL_LOCK, _SLOTS, _STRIPES
+    _POOLS.clear()
+    _COORDINATORS.clear()
+    _LIBRARY_LOCKS.clear()
+    _POOL_LOCK = threading.Lock()
+    _SLOTS = threading.BoundedSemaphore(64)
+    _STRIPES = [threading.Lock() for _ in range(64)]
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_pools)
+
+
+def _library_lock(spec_id: str) -> threading.RLock:
+    library = spec_id.split(".", 1)[0]
+    lock = _LIBRARY_LOCKS.get(library)
+    if lock is None:
+        with _POOL_LOCK:
+            lock = _LIBRARY_LOCKS.setdefault(library, threading.RLock())
+    return lock
+
+
+class _Aborted(BaseException):
+    """Raised inside a frame that is being abandoned because a sibling failed.
+    Never reaches the caller of :func:`run`."""
+
+
+class _Scope:
+    """One running frame.  Marked dead when one of its nodes fails, so that
+    whatever is still running inside it stops at the next node."""
+
+    __slots__ = ("parent", "dead")
+
+    def __init__(self, parent: Optional["_Scope"]):
+        self.parent = parent
+        self.dead = False
+
+    def stopped(self) -> bool:
+        scope: Optional[_Scope] = self
+        while scope is not None:
+            if scope.dead:
+                return True
+            scope = scope.parent
+        return False
+
+
+def _first_error(failures: dict[int, BaseException]) -> BaseException:
+    """The error to report when several things failed at once."""
+    real = {i: exc for i, exc in failures.items() if not isinstance(exc, _Aborted)}
+    if not real:
+        return _Aborted()
+    for exc in real.values():
+        if not isinstance(exc, (NodeError, Cancelled)):
+            return exc                      # KeyboardInterrupt and the like
+    for exc in real.values():
+        if isinstance(exc, Cancelled):
+            return exc
+    return real[min(real)]
+
+
 @dataclass
 class _Context:
     emit: Listener
     check_outputs: Optional[bool]
     cancel: Optional[Callable[[], bool]]
     detect_mutation: bool
+    workers: int = 1
+    cache: Optional[Cache] = None
+    #: With a cache: the token of every value on a top-level wire.
+    tokens: dict[tuple[str, str], bytes] = field(default_factory=dict)
 
 
 def run(graph: Union[Graph, Plan], registry: Optional[Registry] = None, *,
@@ -308,21 +541,32 @@ def run(graph: Union[Graph, Plan], registry: Optional[Registry] = None, *,
         listener: Optional[Listener] = None,
         check_outputs: Optional[bool] = None,
         cancel: Optional[Callable[[], bool]] = None,
-        detect_mutation: bool = False) -> RunResult:
+        detect_mutation: bool = False,
+        workers: Optional[int] = None,
+        cache: Optional[Cache] = None) -> RunResult:
     """Run a graph (or a compiled :class:`Plan`) and return its values.
 
     * ``targets``: only run these nodes and what they depend on.
-    * ``listener``: called with an :class:`Event` as the run progresses.
+    * ``listener``: called with an :class:`Event` as the run progresses, one
+      call at a time.
     * ``check_outputs``: verify each output against its declared type.  By
       default this is done for every node that is not hand-curated.
-    * ``cancel``: called before every node and loop iteration; when it
-      returns true the run stops with :class:`Cancelled`.
+    * ``cancel``: called before every node and loop iteration, possibly from
+      several threads; when it returns true the run stops with
+      :class:`Cancelled`.
     * ``detect_mutation``: debugging aid.  Compare the lists and dicts given
       to each node before and after the call, and fail if a node changed one
       without declaring it.  (Arrays are always protected.)
+    * ``workers``: how many nodes may run at the same time.  Independent
+      branches run in parallel by default; ``workers=1`` runs one node at a
+      time, in order.
+    * ``cache``: a :class:`~openramen.runtime.cache.Cache`.  Pure nodes whose
+      inputs have not changed since an earlier run with the same cache are
+      not run again.
     """
     plan = graph if isinstance(graph, Plan) else compile_graph(graph, registry)
     steps = plan.steps
+    schedule = plan.schedule
     if targets is not None:
         wanted = set(targets)
         known = {s.node for s in steps}
@@ -334,14 +578,23 @@ def run(graph: Union[Graph, Plan], registry: Optional[Registry] = None, *,
             if step.node in wanted:
                 keep |= step.needs
         steps = [s for s in steps if s.node in keep]
+        schedule = _schedule(steps)
 
-    emit = listener or (lambda event: None)
-    context = _Context(emit, check_outputs, cancel, detect_mutation)
+    workers = default_workers() if workers is None else max(1, int(workers))
+    emit: Listener = listener or (lambda event: None)
+    if listener is not None and workers > 1:
+        lock = threading.Lock()
+
+        def emit(event: Event, _send: Listener = listener) -> None:
+            with lock:
+                _send(event)
+
+    context = _Context(emit, check_outputs, cancel, detect_mutation, workers, cache)
     durations: dict[str, float] = {}
     emit(Event("graph-started"))
     started = time.perf_counter()
     try:
-        values, _ = _run_steps(steps, context, "", None, durations)
+        values, _ = _run_steps(steps, schedule, context, "", None, durations)
     except BaseException as exc:
         emit(Event("graph-failed", duration=time.perf_counter() - started, error=exc))
         raise
@@ -350,18 +603,98 @@ def run(graph: Union[Graph, Plan], registry: Optional[Registry] = None, *,
     return RunResult(values, outputs, durations)
 
 
-def _run_steps(steps: list[Step], context: _Context, path: str,
+class Run:
+    """A graph running in the background, as returned by :func:`start`."""
+
+    def __init__(self, plan: Plan, options: dict[str, Any]):
+        self.plan = plan
+        self._stop = threading.Event()
+        self._finished = threading.Event()
+        self._result: Optional[RunResult] = None
+        self._error: Optional[BaseException] = None
+        also = options.pop("cancel", None)
+        stop = self._stop.is_set
+        options["cancel"] = stop if also is None else (lambda: stop() or bool(also()))
+        self._thread = threading.Thread(target=self._work, args=(options,), daemon=True,
+                                        name=f"openramen-run-{plan.name or 'graph'}")
+        self._thread.start()
+
+    def _work(self, options: dict[str, Any]) -> None:
+        try:
+            self._result = run(self.plan, **options)
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self._finished.set()
+
+    def cancel(self) -> None:
+        """Ask the run to stop.  It does so before the next node or loop
+        iteration; a node that is already running finishes first."""
+        self._stop.set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Wait until the run is over; false if ``timeout`` seconds passed first."""
+        return self._finished.wait(timeout)
+
+    @property
+    def done(self) -> bool:
+        return self._finished.is_set()
+
+    @property
+    def cancelled(self) -> bool:
+        """True once the run has stopped because it was cancelled."""
+        return isinstance(self._error, Cancelled)
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        """What stopped the run, if it did not finish; ``None`` while it runs."""
+        return self._error
+
+    def result(self, timeout: Optional[float] = None) -> RunResult:
+        """The values of the run.  Waits for it to finish; raises what stopped
+        it (:class:`NodeError`, :class:`Cancelled`), or ``TimeoutError``."""
+        if not self._finished.wait(timeout):
+            raise TimeoutError("the run has not finished yet")
+        if self._error is not None:
+            raise self._error
+        assert self._result is not None
+        return self._result
+
+    def __repr__(self) -> str:
+        state = "running" if not self.done else "cancelled" if self.cancelled else (
+            "failed" if self._error is not None else "finished")
+        return f"<Run of {self.plan.name or 'graph'!r}: {state}>"
+
+
+def start(graph: Union[Graph, Plan], registry: Optional[Registry] = None,
+          **options: Any) -> Run:
+    """Run a graph in the background and return at once.
+
+    The graph is checked first, so a graph with errors raises here.  Options
+    are those of :func:`run`.  The returned :class:`Run` can be cancelled,
+    waited for, and asked for its result.
+    """
+    plan = graph if isinstance(graph, Plan) else compile_graph(graph, registry)
+    return Run(plan, options)
+
+
+def _run_steps(steps: list[Step], schedule: Optional[_Schedule], context: _Context, path: str,
                boundary: Optional[dict[str, Any]],
-               durations: Optional[dict[str, float]] = None
+               durations: Optional[dict[str, float]] = None,
+               scope: Optional[_Scope] = None
                ) -> tuple[dict[tuple[str, str], Any], dict[str, Any]]:
     """Run one diagram.  For a frame, ``boundary`` feeds its ``inputs`` node
     and the second result is what arrived at its ``outputs`` node."""
+    if schedule is not None and context.workers > 1:
+        return _run_parallel(steps, schedule, context, path, boundary, durations, scope)
     values: dict[tuple[str, str], Any] = {}
     result: dict[str, Any] = {}
     emit = context.emit
     for step in steps:
         if context.cancel is not None and context.cancel():
             raise Cancelled("the run was cancelled")
+        if scope is not None and scope.stopped():
+            raise _Aborted()
         if step.boundary == "in":
             for pin, value in (boundary or {}).items():
                 values[(step.node, pin)] = value
@@ -373,14 +706,147 @@ def _run_steps(steps: list[Step], context: _Context, path: str,
         emit(Event("node-started", name))
         t0 = time.perf_counter()
         try:
-            _execute(step, values, context, path)
+            results = _compute(step, values, context, path, scope)
         except NodeError as exc:
             emit(Event("node-failed", name, time.perf_counter() - t0, exc))
             raise
+        for pin, value in results.items():
+            values[(step.node, pin)] = value
         elapsed = time.perf_counter() - t0
         if durations is not None:
             durations[step.node] = elapsed
         emit(Event("node-finished", name, elapsed))
+    return values, result
+
+
+def _task(step: Step, values: dict[tuple[str, str], Any], context: _Context, path: str,
+          scope: _Scope) -> tuple[dict[str, Any], float]:
+    """Run one node of a diagram that is being run in parallel."""
+    if context.cancel is not None and context.cancel():
+        raise Cancelled("the run was cancelled")
+    if scope.stopped():
+        raise _Aborted()
+    name = path + step.node
+    context.emit(Event("node-started", name))
+    t0 = time.perf_counter()
+    try:
+        results = _compute(step, values, context, path, scope)
+    except NodeError as exc:
+        context.emit(Event("node-failed", name, time.perf_counter() - t0, exc))
+        raise
+    elapsed = time.perf_counter() - t0
+    context.emit(Event("node-finished", name, elapsed))
+    return results, elapsed
+
+
+def _in_slot(fn: Callable[..., Any], *args: Any) -> Any:
+    try:
+        return fn(*args)
+    finally:
+        _SLOTS.release()
+
+
+def _dispatch(step: Step, values: dict[tuple[str, str], Any], context: _Context, path: str,
+              scope: _Scope) -> "Future[tuple[dict[str, Any], float]]":
+    """Start a node on another thread."""
+    if step.structure is None:
+        return _pool(context.workers).submit(_task, step, values, context, path, scope)
+    if _SLOTS.acquire(blocking=False):
+        return _coordinators().submit(_in_slot, _task, step, values, context, path, scope)
+    future: Future[tuple[dict[str, Any], float]] = Future()   # no thread to spare: run it here
+    try:
+        future.set_result(_task(step, values, context, path, scope))
+    except BaseException as exc:
+        future.set_exception(exc)
+    return future
+
+
+def _run_parallel(steps: list[Step], schedule: _Schedule, context: _Context, path: str,
+                  boundary: Optional[dict[str, Any]], durations: Optional[dict[str, float]],
+                  scope: Optional[_Scope]
+                  ) -> tuple[dict[tuple[str, str], Any], dict[str, Any]]:
+    """Run one diagram, starting every node as soon as its inputs are there.
+
+    Cheap nodes run right here; the others go to the thread pool whenever
+    more than one thing could run at the same time.
+    """
+    mine = _Scope(scope)
+    values: dict[tuple[str, str], Any] = {}
+    result: dict[str, Any] = {}
+    pending = list(schedule.pending)
+    consumers = schedule.consumers
+    ready = [i for i, count in enumerate(pending) if not count]
+    in_flight: dict[Future[tuple[dict[str, Any], float]], int] = {}
+    failures: dict[int, BaseException] = {}
+    current = -1
+
+    def release(i: int) -> None:
+        for consumer in consumers[i]:
+            pending[consumer] -= 1
+            if not pending[consumer]:
+                heapq.heappush(ready, consumer)
+
+    def done(i: int, outcome: tuple[dict[str, Any], float]) -> None:
+        results, elapsed = outcome
+        step = steps[i]
+        for pin, value in results.items():
+            values[(step.node, pin)] = value
+        step.cost = elapsed if step.cost < 0 else 0.7 * step.cost + 0.3 * elapsed
+        if durations is not None:
+            durations[step.node] = elapsed
+        release(i)
+
+    try:
+        while ready or in_flight:
+            heavy: list[int] = []
+            while ready:
+                current = i = heapq.heappop(ready)
+                step = steps[i]
+                if step.boundary == "in":
+                    for pin, value in (boundary or {}).items():
+                        values[(step.node, pin)] = value
+                    release(i)
+                elif step.boundary == "out":
+                    result = _gather(step, values, path, protect=False)
+                    release(i)
+                elif step.heavy and not 0 <= step.cost < _CHEAP:
+                    heavy.append(i)
+                else:
+                    done(i, _task(step, values, context, path, mine))
+            if len(heavy) == 1 and not in_flight:
+                # nothing else could run meanwhile: no need for another thread
+                current = heavy[0]
+                done(current, _task(steps[current], values, context, path, mine))
+                continue
+            for i in heavy:
+                current = i
+                in_flight[_dispatch(steps[i], values, context, path, mine)] = i
+            if in_flight:
+                finished, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)
+                for future in sorted(finished, key=in_flight.__getitem__):
+                    i = in_flight.pop(future)
+                    try:
+                        outcome = future.result()
+                    except BaseException as exc:
+                        failures[i] = exc
+                    else:
+                        done(i, outcome)
+                if failures:
+                    break
+    except BaseException as exc:
+        failures[current] = exc
+    if failures:
+        mine.dead = True
+        for future in in_flight:
+            future.cancel()
+        if in_flight:
+            wait(list(in_flight))
+            for future, i in in_flight.items():
+                if not future.cancelled():
+                    error = future.exception()
+                    if error is not None:
+                        failures.setdefault(i, error)
+        raise _first_error(failures)
     return values, result
 
 
@@ -414,18 +880,88 @@ def _gather(step: Step, values: dict[tuple[str, str], Any], path: str,
     return arguments
 
 
-def _execute(step: Step, values: dict[tuple[str, str], Any], context: _Context,
-             path: str) -> None:
+def _identity(step: Step) -> bytes:
+    """Fingerprint of what is fixed about a step, or ``b""`` if it has none."""
+    if step.identity is not None:
+        return step.identity
+    spec = step.spec
+    parts = [spec.id.encode(), spec.version.encode()]
+    known = True
+    for label, fixed in (("literal", step.literals), ("config", step.config)):
+        for name in sorted(fixed):
+            printed = _cache.fingerprint(fixed[name])
+            if printed is None:
+                known = False
+                break
+            parts += [f"{label}:{name}".encode(), printed]
+    parts += [f"{pin}:{mode}".encode() for pin, _, mode, _, _ in step.wired]
+    if known and step.structure is not None:
+        try:
+            parts.append(repr(_structure_to_dict(step.structure.node)).encode("utf-8", "replace"))
+        except Exception:
+            known = False                  # holds a value that cannot be written down
+        for frame in step.structure.frames:
+            for inner in frame.steps:
+                if not inner.boundary:
+                    known = known and bool(_identity(inner))
+                    parts.append(inner.identity or b"")
+    elif known:
+        try:
+            parts.append(_cache.function_identity(spec.resolve()))
+        except Exception:
+            known = False
+    step.identity = _cache.digest(*parts) if known else b""
+    return step.identity
+
+
+def _compute(step: Step, values: dict[tuple[str, str], Any], context: _Context,
+             path: str, scope: Optional[_Scope]) -> dict[str, Any]:
+    """Run one node and return its outputs, normalised and verified.  At the
+    top level of a run with a cache, pure nodes are looked up first."""
+    cache = context.cache
+    if cache is None or path:
+        return _compute_now(step, values, context, path, scope)
+    tokens = context.tokens
+    key = b""
+    if step.pure and _identity(step):
+        try:
+            key = _cache.digest(step.identity or b"",
+                                *(tokens[source] for _, source, _, _, _ in step.wired))
+        except KeyError:
+            key = b""
+    if key:
+        found = cache.get(key)
+        if found is not None:
+            results, kept = found
+            for pin, token in kept.items():
+                tokens[(step.node, pin)] = token
+            context.emit(Event("node-cached", step.node))
+            return results
+    results = _compute_now(step, values, context, path, scope)
+    made: dict[str, bytes] = {}
+    for pin, value in results.items():
+        token = _cache.content_token(value) or (
+            _cache.digest(key, pin.encode()) if key else _cache.unique_token())
+        made[pin] = tokens[(step.node, pin)] = token
+    if key:
+        cache.put(key, results, made)
+    return results
+
+
+def _compute_now(step: Step, values: dict[tuple[str, str], Any], context: _Context,
+                 path: str, scope: Optional[_Scope]) -> dict[str, Any]:
     spec = step.spec
     name = path + step.node
     arguments = _gather(step, values, path)
     if step.structure is not None:
-        results = _run_structure(step, arguments, context, path)
+        results = _run_structure(step, arguments, context, path, scope)
+    elif spec.thread_safe and not (step.guarded and context.workers > 1):
+        results = _call_unlocked(step, arguments, context, name)
     else:
         results = _call(step, arguments, context, name)
     verify = spec.tier != "curated" if context.check_outputs is None else context.check_outputs
     for pin, value in results.items():
-        value = T.plain_scalar(value)
+        results[pin] = value = T.plain_scalar(value)
         if verify and not T.conforms(value, step.out_types[pin]):
             declared = spec.output(pin)
             origin = f" (a type taken from its {declared.source})" if (
@@ -434,13 +970,64 @@ def _execute(step: Step, values: dict[tuple[str, str], Any], context: _Context,
                 f"output is declared {step.out_types[pin]}{origin} but the node returned "
                 f"{T.type_of(value)}")
             raise NodeError(name, spec.id, mismatch, pin, str(mismatch))
-        values[(step.node, pin)] = value
+    return results
 
 
 def _call(step: Step, arguments: dict[str, Any], context: _Context,
           name: str) -> dict[str, Any]:
+    """Call the function of a node, holding the locks it needs."""
+    spec = step.spec
+    held: list[Any] = []
+    if not spec.thread_safe:
+        held.append(_library_lock(spec.id))
+    if step.guarded and context.workers > 1:
+        stripes = {(id(value) >> 4) % 64 for value in arguments.values()
+                   if not isinstance(value, _VALUES)}
+        held.extend(_STRIPES[index] for index in sorted(stripes))
+    if not held:
+        return _call_unlocked(step, arguments, context, name)
+    for lock in held:
+        lock.acquire()
+    try:
+        return _call_unlocked(step, arguments, context, name)
+    finally:
+        for lock in reversed(held):
+            lock.release()
+
+
+def _call_remote(step: Step, arguments: dict[str, Any], config: dict[str, Any],
+                 context: _Context, name: str) -> Optional[dict[str, Any]]:
+    """Call a node in a worker process.  ``None``: it has to run here instead."""
+    spec = step.spec
+    try:
+        results, needed_writable = _workers.call(spec, arguments, config, context.cancel)
+    except _workers.Unsendable as exc:
+        _LOCAL_ONLY.add(spec.id)
+        context.emit(Event("node-warning", name,
+                           message=f"{spec.id} runs in this process, not in a worker: {exc}"))
+        return None
+    except _workers.Stopped:
+        raise Cancelled("the run was cancelled") from None
+    except _workers.RemoteError as exc:
+        raise NodeError(name, spec.id, exc.original) from exc
+    except _workers.WorkerDied as exc:
+        raise NodeError(name, spec.id, exc) from exc
+    if needed_writable:
+        _NEEDS_WRITABLE.add(spec.id)
+        context.emit(Event("node-warning", name,
+                           message=f"{spec.id} needs writable arrays; its array inputs "
+                                   "are given private copies"))
+    return results
+
+
+def _call_unlocked(step: Step, arguments: dict[str, Any], context: _Context,
+                   name: str) -> dict[str, Any]:
     spec = step.spec
     config = {key: _fresh(value) for key, value in step.config.items()}
+    if step.remote and spec.id not in _LOCAL_ONLY:
+        remote = _call_remote(step, arguments, config, context, name)
+        if remote is not None:
+            return remote
     watched: dict[str, Any] = {}
     if context.detect_mutation and (spec.id, spec.version) not in _VERIFIED:
         declared = {pin for pin, _, _, _, use in step.wired if use != _READ}
@@ -506,19 +1093,26 @@ def _elements(value: Any) -> Iterator[Any]:
     return iter(value)
 
 
+_Frame = Callable[..., dict[str, Any]]
+
+
 def _run_structure(step: Step, arguments: dict[str, Any], context: _Context,
-                   path: str) -> dict[str, Any]:
+                   path: str, scope: Optional[_Scope]) -> dict[str, Any]:
     plan = step.structure
     assert plan is not None
     node = plan.node
     name = path + step.node
     spec_id = step.spec.id
     converts: dict[str, T.Type] = plan.data.get("convert", {})
+    numbered = node.kind in ("case", "try")
 
-    def frame(index: int, boundary: dict[str, Any], what: str) -> dict[str, Any]:
-        inner = f"{name}[{index}]/" if node.kind == "case" else name + "/"
+    def frame(index: int, boundary: dict[str, Any], what: str,
+              within: Optional[_Scope] = scope) -> dict[str, Any]:
+        inner = f"{name}[{index}]/" if numbered else name + "/"
+        chosen = plan.frames[index]
         try:
-            _, result = _run_steps(plan.frames[index].steps, context, inner, boundary)
+            _, result = _run_steps(chosen.steps, chosen.schedule, context, inner, boundary,
+                                   None, within)
         except NodeError as exc:
             exc.context.append(what)
             raise
@@ -533,10 +1127,16 @@ def _run_structure(step: Step, arguments: dict[str, Any], context: _Context,
         except T.TypeMismatch as exc:
             raise NodeError(name, spec_id, exc, pin, str(exc)) from exc
 
-    if node.kind == "subgraph":
-        result = frame(0, {t.name: arguments[t.name] for t in node.inputs}, f"in {name!r}")
+    def leave(result: dict[str, Any]) -> dict[str, Any]:
         return {t.name: finish(t.name, _tunnel_value(t, result, name, spec_id))
                 for t in node.outputs}
+
+    if node.kind in ("for", "while"):
+        return _run_loop(step, arguments, context, name, frame, finish, scope)
+
+    boundary = {t.name: arguments[t.name] for t in node.inputs}
+    if node.kind == "subgraph":
+        return leave(frame(0, boundary, f"in {name!r}"))
 
     if node.kind == "case":
         selector = arguments["selector"]
@@ -544,13 +1144,49 @@ def _run_structure(step: Step, arguments: dict[str, Any], context: _Context,
         index = _matching_frame(node.cases, key)
         if index is None:
             raise _fail(name, spec_id, f"no frame handles the selector value {key!r}", "selector")
-        boundary = {t.name: arguments[t.name] for t in node.inputs}
         boundary["selector"] = selector
-        result = frame(index, boundary, f"frame {index} of {name!r}")
-        return {t.name: finish(t.name, _tunnel_value(t, result, name, spec_id))
-                for t in node.outputs}
+        return leave(frame(index, boundary, f"frame {index} of {name!r}"))
 
-    return _run_loop(step, arguments, context, name, frame, finish)
+    if node.kind == "try":
+        message = ""
+        try:
+            result = frame(0, boundary, f"in the body of {name!r}")
+        except NodeError as exc:
+            message = str(exc)
+            handler = dict(boundary, error=message, error_type=type(exc.original).__name__)
+            result = frame(1, handler, f"in the error handler of {name!r}")
+        outputs = leave(result)
+        outputs.update(failed=bool(message), error=message)
+        return outputs
+
+    # with: enter the context manager, run the frame, always leave again
+    resource = arguments["resource"]
+    enter = getattr(type(resource), "__enter__", None)
+    leave_resource = getattr(type(resource), "__exit__", None)
+    if enter is None or leave_resource is None:
+        raise _fail(name, spec_id,
+                    f"'resource' is a {T.type_of(resource)}, not a context manager", "resource")
+    try:
+        boundary["resource"] = T.plain_scalar(enter(resource))
+    except Exception as exc:
+        raise NodeError(name, spec_id, exc, "resource") from exc
+    try:
+        result = frame(0, boundary, f"in {name!r}")
+    except BaseException as exc:
+        cause = exc.original if isinstance(exc, NodeError) else exc
+        try:
+            suppressed = leave_resource(resource, type(cause), cause, cause.__traceback__)
+        except Exception as closing:
+            raise NodeError(name, spec_id, closing, "resource") from exc
+        if not suppressed or not isinstance(exc, NodeError):
+            raise
+        result = {}             # the context manager swallowed the error
+    else:
+        try:
+            leave_resource(resource, None, None, None)
+        except Exception as exc:
+            raise NodeError(name, spec_id, exc, "resource") from exc
+    return leave(result)
 
 
 def _matching_frame(cases: list, key: Any) -> Optional[int]:
@@ -577,9 +1213,42 @@ def _tunnel_value(tunnel: Any, result: dict[str, Any], name: str, spec_id: str) 
     raise _fail(name, spec_id, f"output {tunnel.name!r} received no value", tunnel.name)
 
 
+def _spread(count: int, body: Callable[[int], Any], context: _Context,
+            mine: _Scope) -> list[Any]:
+    """Run ``body(0) ... body(count - 1)`` on several threads, this one included."""
+    results: list[Any] = [None] * count
+    failures: dict[int, BaseException] = {}
+    numbers = iter(range(count))
+    lock = threading.Lock()
+
+    def runner() -> None:
+        while not mine.dead:
+            with lock:
+                i = next(numbers, None)
+            if i is None:
+                return
+            try:
+                results[i] = body(i)
+            except BaseException as exc:
+                failures[i] = exc
+                mine.dead = True
+
+    helpers: list[Future[Any]] = []
+    for _ in range(min(context.workers, count) - 1):
+        if not _SLOTS.acquire(blocking=False):
+            break
+        helpers.append(_coordinators().submit(_in_slot, runner))
+    runner()
+    if helpers:
+        wait(helpers)
+    if failures:
+        raise _first_error(failures)
+    return results
+
+
 def _run_loop(step: Step, arguments: dict[str, Any], context: _Context, name: str,
-              frame: Callable[[int, dict[str, Any], str], dict[str, Any]],
-              finish: Callable[[str, Any], Any]) -> dict[str, Any]:
+              frame: _Frame, finish: Callable[[str, Any], Any],
+              scope: Optional[_Scope]) -> dict[str, Any]:
     plan = step.structure
     assert plan is not None
     node = plan.node
@@ -609,36 +1278,10 @@ def _run_loop(step: Step, arguments: dict[str, Any], context: _Context, name: st
     if is_for and count is None and not indexed:
         raise _fail(name, spec_id, "a For loop needs a count or an indexing input", "count")
 
-    registers: dict[str, Any] = {}
-    owned: dict[str, Any] = {}        # the buffers of in-place registers
-    for register in node.registers:
-        value = into_register(register, arguments[register])
-        if register in plan.in_place:
-            value = owned[register] = _private(value)
-        registers[register] = value
-
     last: dict[str, Any] = {}
     gathered: dict[str, list[Any]] = {t.name: [] for t in node.outputs if t.mode != "last"}
-    limit = node.max_iterations
-    i = 0
-    while count is None or i < count:
-        if context.cancel is not None and context.cancel():
-            raise Cancelled("the run was cancelled")
-        boundary = dict(plain)
-        try:
-            for pin, iterator in indexed.items():
-                boundary[pin] = T.plain_scalar(next(iterator))
-        except StopIteration:
-            break
-        for register in plan.in_place:
-            if registers[register] is not owned.get(register):
-                # the loop fed back some other object: take a buffer of our own again
-                registers[register] = owned[register] = _private(registers[register])
-        boundary.update(registers)
-        boundary["i"] = i
-        result = frame(0, boundary, f"iteration {i} of {name!r}")
-        for register in node.registers:
-            registers[register] = into_register(register, result[register])
+
+    def keep(result: dict[str, Any]) -> None:
         for tunnel in node.outputs:
             if tunnel.name not in result:
                 continue
@@ -646,17 +1289,70 @@ def _run_loop(step: Step, arguments: dict[str, Any], context: _Context, name: st
                 last[tunnel.name] = result[tunnel.name]
             else:
                 gathered[tunnel.name].append(result[tunnel.name])
-        i += 1
-        if not is_for:
-            stop = result.get("stop")
-            if not isinstance(stop, (bool, np.bool_)):
-                raise _fail(name, spec_id,
-                            f"'stop' must be a Bool, got {T.type_of(stop)}", "stop")
-            if stop:
+
+    registers: dict[str, Any] = {}
+    if node.parallel and context.workers > 1 and not node.registers:
+        # every iteration is independent: work out what each one receives,
+        # then run them on several threads and keep the results in order
+        rows: list[tuple[Any, ...]]
+        if indexed:
+            columns = zip(*indexed.values())
+            rows = list(columns if count is None else itertools.islice(columns, max(count, 0)))
+        else:
+            rows = [()] * max(count or 0, 0)
+        pins = list(indexed)
+        mine = _Scope(scope)
+
+        def iteration(i: int) -> dict[str, Any]:
+            if context.cancel is not None and context.cancel():
+                raise Cancelled("the run was cancelled")
+            boundary = dict(plain)
+            for pin, value in zip(pins, rows[i]):
+                boundary[pin] = T.plain_scalar(value)
+            boundary["i"] = i
+            return frame(0, boundary, f"iteration {i} of {name!r}", mine)
+
+        for result in _spread(len(rows), iteration, context, mine):
+            keep(result)
+    else:
+        owned: dict[str, Any] = {}        # the buffers of in-place registers
+        for register in node.registers:
+            value = into_register(register, arguments[register])
+            if register in plan.in_place:
+                value = owned[register] = _private(value)
+            registers[register] = value
+        limit = node.max_iterations
+        i = 0
+        while count is None or i < count:
+            if context.cancel is not None and context.cancel():
+                raise Cancelled("the run was cancelled")
+            boundary = dict(plain)
+            try:
+                for pin, iterator in indexed.items():
+                    boundary[pin] = T.plain_scalar(next(iterator))
+            except StopIteration:
                 break
-            if limit is not None and i >= limit:
-                raise _fail(name, spec_id,
-                            f"the loop did not stop within {limit} iterations", "stop")
+            for register in plan.in_place:
+                if registers[register] is not owned.get(register):
+                    # the loop fed back some other object: take a buffer of our own again
+                    registers[register] = owned[register] = _private(registers[register])
+            boundary.update(registers)
+            boundary["i"] = i
+            result = frame(0, boundary, f"iteration {i} of {name!r}")
+            for register in node.registers:
+                registers[register] = into_register(register, result[register])
+            keep(result)
+            i += 1
+            if not is_for:
+                stop = result.get("stop")
+                if not isinstance(stop, (bool, np.bool_)):
+                    raise _fail(name, spec_id,
+                                f"'stop' must be a Bool, got {T.type_of(stop)}", "stop")
+                if stop:
+                    break
+                if limit is not None and i >= limit:
+                    raise _fail(name, spec_id,
+                                f"the loop did not stop within {limit} iterations", "stop")
 
     outputs: dict[str, Any] = {}
     for tunnel in node.outputs:

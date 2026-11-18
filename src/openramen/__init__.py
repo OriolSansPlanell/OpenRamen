@@ -19,7 +19,9 @@ from .library import (
     spec_from_function,
 )
 from .model import CycleError, Graph, GraphError, Node, Structure, Tunnel, Wire
-from .runtime import Cancelled, Event, NodeError, Plan, RunResult, compile_graph, run
+from .runtime import (
+    Cache, Cancelled, Event, NodeError, Plan, Run, RunResult, compile_graph, run, start,
+)
 
 __version__ = "0.1.0.dev0"
 
@@ -29,6 +31,6 @@ __all__ = [
     "default_registry", "spec_from_function", "DEFAULT", "ImportFailure",
     "import_callable", "import_module", "pin_outputs",
     "analyze", "Analysis", "Problem", "GraphCheckError", "registry_for",
-    "run", "compile_graph", "Plan", "RunResult", "Event", "NodeError", "Cancelled",
+    "run", "compile_graph", "Plan", "RunResult", "Event", "NodeError", "Cancelled", "Run", "start", "Cache",
     "__version__",
 ]
