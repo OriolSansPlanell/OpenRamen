@@ -23,7 +23,8 @@ worker processes, caching, Stop) work and are tested; there is no editor yet.
 
 ## Try it
 
-Requires Python 3.10 or newer and NumPy 2.
+Requires Python 3.10 or newer and NumPy 2. The tests run on Linux, macOS and
+Windows on every push.
 
 ```bash
 pip install -e .
