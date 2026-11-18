@@ -5,6 +5,7 @@ import dataclasses
 import enum
 import os
 import random
+import types
 import typing
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import (
@@ -293,6 +294,8 @@ def test_from_annotation_never_raises():
     assert from_annotation(typing.ForwardRef("Nope")) == ANY
     assert from_annotation(...) == ANY
     assert from_annotation(Union) == ANY
+    assert from_annotation(types.UnionType) == ANY      # the same object from Python 3.14
+    assert from_annotation(typing.Optional) == ANY
     assert isinstance(from_annotation(CallableT((INT,), INT)), CallableT)
     assert from_annotation(IteratorT(INT)) == IteratorT(INT)
     assert from_annotation(DictT()) == DictT(ANY, ANY)

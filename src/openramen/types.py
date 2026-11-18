@@ -1423,6 +1423,9 @@ _SIMPLE: dict[Any, Type] = {
     bytes: BYTES, type(None): NONE, None: NONE, Any: ANY, object: ANY,
     list: ListT(ANY), dict: DictT(ANY, ANY), tuple: TupleT((ANY,), True),
     np.ndarray: ArrayT(), os.PathLike: PATH,
+    # A bare ``Union`` says nothing.  Since Python 3.14 typing.Union and
+    # types.UnionType are one class, which would otherwise read as an object type.
+    typing.Union: ANY, _pytypes.UnionType: ANY, typing.Optional: ANY,
 }
 
 _ALIAS = getattr(typing, "TypeAliasType", None)  # Python 3.12+
