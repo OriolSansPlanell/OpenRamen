@@ -108,6 +108,25 @@ class TestProcessNodes:
         seen = {run(one(registry, "p.pid"), registry)["n"] for _ in range(5)}
         assert len(seen) <= workers.limit() and len(workers._LANES) <= workers.limit()
 
+    def test_a_worker_is_sent_each_node_once(self, registry, monkeypatch):
+        import pickle
+        monkeypatch.setattr(workers, "limit", lambda: 1)
+        workers.shutdown()
+        sent = []
+        exchange = workers._Lane.exchange
+
+        def recording(lane, message, cancel):
+            request = pickle.loads(message)
+            if request[0] == "call":
+                sent.append(request[2] is not None)        # was the node itself included?
+            return exchange(lane, message, cancel)
+
+        monkeypatch.setattr(workers._Lane, "exchange", recording)
+        plan = compile_graph(one(registry, "p.count_primes", limit=50), registry)
+        assert [run(plan)["n"] for _ in range(3)] == [15, 15, 15]
+        assert sent == [True, False, False]
+        workers.shutdown()
+
     def test_errors_come_back(self, registry):
         with pytest.raises(NodeError, match="ValueError: no good") as info:
             run(one(registry, "p.fail", message="no good"), registry)

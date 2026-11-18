@@ -313,9 +313,9 @@ to ask for it: `run` starts every node as soon as its inputs are there.
   its library (the first part of the spec id), so they run one at a time.
 - An object with reference semantics (an `Object` wire) is used by one node at
   a time.
-- When a node fails, nothing new starts in its diagram, the nodes already
-  running finish, and structures still running inside the diagram stop at
-  their next node. If several nodes fail at once, the one that comes first
+- When a node fails, nothing new starts in its diagram (so an independent
+  node may or may not have run), the nodes already running finish, and
+  structures still running inside the diagram stop at their next node. If several nodes fail at once, the one that comes first
   in the one-worker order is reported.
 - A listener is called with one event at a time, but the events of nodes
   that run together arrive in no fixed order. `cancel` may be called from
