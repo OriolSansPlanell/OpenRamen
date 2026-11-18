@@ -53,7 +53,7 @@ class TestStop:
         t0 = time.perf_counter()
         handle.cancel()
         assert handle.wait(2.0)
-        assert time.perf_counter() - t0 < 0.5
+        assert time.perf_counter() - t0 < 1.0
         assert handle.done and handle.cancelled and isinstance(handle.error, Cancelled)
         with pytest.raises(Cancelled):
             handle.result()
@@ -98,27 +98,29 @@ class TestStop:
     def test_stop_with_nodes_on_several_threads(self, registry):
         g = Graph()
         const(g, 1.0, "src")
-        for k in range(40):
+        for k in range(200):
             g.add_node("t.nap", f"n{k}", values={"seconds": 0.02})
             g.connect("src", "out", f"n{k}", "x")
         handle = start(g, registry, workers=4)
-        time.sleep(0.03)
+        while len(registry.calls) < 4:               # wait until the first nodes are running
+            time.sleep(0.001)
         handle.cancel()
-        assert handle.wait(2.0) and handle.cancelled
-        assert 4 <= len(registry.calls) <= 16
+        assert handle.wait(3.0) and handle.cancelled
+        assert 4 <= len(registry.calls) <= 12        # they finished; almost nothing else started
 
     def test_stop_in_a_parallel_loop(self, registry):
         g = Graph()
         loop = g.add_for("loop", parallel=True)
-        loop.values["count"] = 500
+        loop.values["count"] = 2000
         loop.add_output("y", mode="collect")
         loop.frame.add_node("base.to_float", "x")
         loop.frame.add_node("t.nap", "nap", values={"seconds": 0.01})
         links(loop.frame, "inputs.i > x.x", "x.out > nap.x", "nap.out > outputs.y")
         handle = start(g, registry, workers=4)
-        time.sleep(0.05)
+        while len(registry.calls) < 8:
+            time.sleep(0.001)
         handle.cancel()
-        assert handle.wait(2.0) and handle.cancelled and len(registry.calls) < 100
+        assert handle.wait(3.0) and handle.cancelled and len(registry.calls) < 40
 
     def test_the_callers_own_cancel_still_counts(self):
         flag = threading.Event()

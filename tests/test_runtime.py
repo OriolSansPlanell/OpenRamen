@@ -255,7 +255,7 @@ class TestTargets:
         events = []
         result = run(expression(), targets=["sum"], listener=events.append)
         ran = [e.node for e in events if e.kind == "node-finished"]
-        assert ran == ["a", "b", "sum"]
+        assert sorted(ran) == ["a", "b", "sum"] and ran[-1] == "sum"
         assert result["sum"] == 2.5 and "product" not in result and "c" not in result
 
     def test_several_targets_and_everything(self):

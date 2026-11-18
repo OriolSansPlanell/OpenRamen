@@ -110,9 +110,9 @@ class TestParallelBranches:
         g = branches(2)
         result, parallel = timed(g, registry)
         assert result["n0"] == result["n1"] == 1.0 and probe.most == 2
-        assert parallel < NAP * 1.7
         _, serial = timed(g, registry, workers=1)
         assert serial > NAP * 1.9 and probe.most == 2
+        assert parallel < serial * 0.8                 # ideally half
 
     def test_workers_limit_how_many_run_at_once(self, registry, probe):
         g = branches(6, seconds=0.05)
@@ -354,14 +354,9 @@ class TestFailures:
 
     def test_cancel_while_nodes_are_running(self, registry, probe):
         g = branches(8, seconds=0.03)
-        started = time.perf_counter()
-
-        def cancel():
-            return time.perf_counter() - started > 0.04
-
         with pytest.raises(Cancelled):
-            run(g, registry, cancel=cancel, workers=2)
-        assert 2 <= len(probe.log) < 8                 # running nodes finished, the rest never ran
+            run(g, registry, cancel=lambda: len(probe.log) >= 2, workers=2)
+        assert 2 <= len(probe.log) <= 4                # running nodes finished, the rest never ran
 
     def test_nothing_leaks_out_of_an_abandoned_frame(self, registry):
         # 'boom' fails at once while a loop in the other branch is busy: the
@@ -420,8 +415,9 @@ class TestNesting:
             links(sub.frame, "n0.out > sum.a", "n1.out > sum.b", "sum.out > outputs.y")
             g.connect("src", "out", sub, "x")
         result, elapsed = timed(g, registry, workers=4)
-        assert result["s0"] == result["s1"] == 2.0
-        assert probe.most == 4 and elapsed < NAP * 1.8
+        assert result["s0"] == result["s1"] == 2.0 and probe.most == 4
+        _, serial = timed(g, registry, workers=1)
+        assert elapsed < serial * 0.6                  # four naps at once: ideally a quarter
 
     def test_no_deadlock_when_no_frame_thread_is_free(self, registry, probe, monkeypatch):
         monkeypatch.setattr(runtime, "_SLOTS", threading.BoundedSemaphore(1))
@@ -460,7 +456,8 @@ class TestNesting:
         links(f, "inputs.i > x.x", "n0.out > sum.a", "n1.out > sum.b", "sum.out > outputs.sums")
         result, elapsed = timed(g, registry)
         assert result["loop"] == [0.0, 2.0, 4.0] and probe.most == 2
-        assert elapsed < 0.08 * 6 * 0.8                # six naps, two at a time
+        _, serial = timed(g, registry, workers=1)
+        assert elapsed < serial * 0.8                  # six naps, two at a time: ideally half
 
 
 class TestParallelFor:
@@ -483,8 +480,9 @@ class TestParallelFor:
         result, elapsed = timed(g, registry, workers=3, check_outputs=True)
         out = result["loop"]
         assert out["y"] == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0] and out["last"] == 5.0
-        assert out["index"].tolist() == [0, 1, 2, 3, 4, 5]
-        assert probe.most == 3 and elapsed < 0.08 * 6 * 0.7    # six naps, three at a time
+        assert out["index"].tolist() == [0, 1, 2, 3, 4, 5] and probe.most == 3
+        _, serial = timed(g, registry, workers=1)
+        assert elapsed < serial * 0.7                  # three at a time: ideally a third
 
     def test_same_results_as_the_ordinary_loop(self, registry):
         parallel, _ = self.loop(registry, seconds=0.0)

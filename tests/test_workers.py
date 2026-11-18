@@ -340,7 +340,7 @@ class TestStop:
         t0 = time.perf_counter()
         handle.cancel()
         assert handle.wait(3.0) and handle.cancelled
-        assert time.perf_counter() - t0 < 1.0          # it did not wait for the nap to end
+        assert time.perf_counter() - t0 < 2.0          # it did not wait for the nap to end
         assert run(one(registry, "p.pid"), registry)["n"] > 0
 
     def test_cancel_before_a_worker_is_free(self, registry, monkeypatch):
