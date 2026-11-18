@@ -165,7 +165,10 @@ class TestTry:
         body.add_node("t.note", "before")
         body.add_node("t.note", "after")
         links(body, "inputs.a > before.x", "div.out > after.x")
-        assert run(g, registry)["attempt"]["failed"] is True and seen == [7]
+        assert run(g, registry, workers=1)["attempt"]["failed"] is True and seen == [7]
+        seen.clear()
+        assert run(g, registry, workers=4)["attempt"]["failed"] is True
+        assert seen in ([], [7])       # 'before' may not have started yet; 'after' never runs
 
     def test_try_inside_a_loop_and_a_loop_inside_try(self):
         g = Graph()

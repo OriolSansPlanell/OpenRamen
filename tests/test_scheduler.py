@@ -65,7 +65,13 @@ def registry(probe):
         return x + 1.0
 
     @r.node("t.boom")
-    def boom(x: float, seconds: float = 0.0) -> float:
+    def boom(x: float, seconds: float = 0.0, busy: int = 0, label: str = "") -> float:
+        """Fail: after a pause, or once ``busy`` other nodes are running."""
+        if label:
+            probe.enter(label)
+        deadline = time.perf_counter() + 10.0
+        while probe.running < busy + bool(label) and time.perf_counter() < deadline:
+            time.sleep(0.001)
         time.sleep(seconds)
         raise ValueError(f"boom {x}")
 
@@ -115,7 +121,7 @@ class TestParallelBranches:
         assert parallel < serial * 0.8                 # ideally half
 
     def test_workers_limit_how_many_run_at_once(self, registry, probe):
-        g = branches(6, seconds=0.05)
+        g = branches(6, seconds=0.15)
         run(g, registry, workers=3)
         assert probe.most == 3
         probe.most = 0
@@ -148,7 +154,9 @@ class TestParallelBranches:
         assert {probe.threads["n0"], probe.threads["n1"]} != {"MainThread"}
 
     @adaptive
-    def test_nodes_that_prove_cheap_stay_in_the_calling_thread(self, registry, probe):
+    def test_nodes_that_prove_cheap_stay_in_the_calling_thread(self, registry, probe,
+                                                                monkeypatch):
+        monkeypatch.setattr(runtime, "_CHEAP", 0.05)   # so a hiccup of the machine cannot matter
         plan = compile_graph(branches(3, spec="t.quick"), registry)
         assert plan.schedule is not None and all(s.cost < 0 for s in plan.steps)
         run(plan)                                    # unknown cost: they are dispatched
@@ -305,27 +313,29 @@ class TestOrderAndLocks:
 class TestFailures:
     def test_a_failure_stops_the_rest(self, registry, probe):
         g = branches(2, seconds=0.05)
-        g.add_node("t.boom", "bad")
+        g.add_node("t.boom", "bad", values={"busy": 2})      # fails once both naps are running
         g.connect("src", "out", "bad", "x")
         g.add_node("t.nap", "later", values={"label": "later", "seconds": 0.0})
         g.connect("n0", "out", "later", "x")
         events = []
         with pytest.raises(NodeError, match="boom 1.0") as info:
-            run(g, registry, listener=events.append)
+            run(g, registry, listener=events.append, workers=4)
         assert info.value.node == "bad" and isinstance(info.value.original, ValueError)
         assert "later" not in probe.log                        # never started
         assert sorted(probe.log) == ["n0", "n1"]                # what was running finished
         assert events[-1].kind == "graph-failed" and events[-1].error is info.value
         assert [e.node for e in events if e.kind == "node-failed"] == ["bad"]
 
-    def test_the_first_failing_node_in_order_is_reported(self, registry):
+    def test_the_first_failing_node_in_order_is_reported(self, registry, probe):
         g = Graph()
         const(g, 1.0, "one")
         const(g, 2.0, "two")
-        g.add_node("t.boom", "a_slow", values={"seconds": 0.05})
-        g.add_node("t.boom", "b_fast")
+        # 'b_fast' fails first, while 'a_slow' is running; then 'a_slow' fails too
+        g.add_node("t.boom", "a_slow", values={"seconds": 0.05, "label": "a_slow"})
+        g.add_node("t.boom", "b_fast", values={"busy": 1})
         links(g, "one.out > a_slow.x", "two.out > b_fast.x")
         for _ in range(3):
+            probe.running = 0
             with pytest.raises(NodeError) as info:
                 run(g, registry)
             assert info.value.node == "a_slow"
@@ -450,7 +460,7 @@ class TestNesting:
         f = loop.frame
         f.add_node("base.to_float", "x")
         for j in range(2):
-            f.add_node("t.nap", f"n{j}", values={"label": f"n{j}", "seconds": 0.08})
+            f.add_node("t.nap", f"n{j}", values={"label": f"n{j}", "seconds": 0.1})
             f.connect("x", "out", f"n{j}", "x")
         f.add_node("base.add", "sum")
         links(f, "inputs.i > x.x", "n0.out > sum.a", "n1.out > sum.b", "sum.out > outputs.sums")
